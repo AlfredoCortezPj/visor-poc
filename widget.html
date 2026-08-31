@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Visor · POC de migración a Creator</title>
+
+  <!--
+    SDK de Zoho Creator (widget JS SDK).
+    v2.0 abre las tareas JS API v2. Si tu cuenta espera v1, cambia 2.0 -> 1.0.
+    Si abres este archivo suelto en el navegador (fuera de Creator) el SDK no
+    cargará: el widget lo detecta y sigue funcionando en MODO MOCK.
+  -->
+  <script src="https://js.zohostatic.com/creator/widgets/version/2.0/widgetsdk-min.js"></script>
+
+  <!-- Librería externa de ejemplo: prueba que puedes usar tus libs (SortableJS = tu field manager). -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+
+  <style>
+    :root{
+      --bg:#ffffff; --ink:#1c2430; --muted:#5b6775; --line:#e4e8ee;
+      --panel:#f7f9fc; --accent:#2b6cb0;
+      --ok:#2f9e44; --warn:#e8a317; --bad:#e03131; --idle:#adb5bd;
+      --mono:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;
+      --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.45;font-size:14px}
+    .wrap{max-width:1080px;margin:0 auto;padding:20px}
+    h1{font-size:19px;margin:0 0 2px}
+    .sub{color:var(--muted);margin:0 0 18px;font-size:13px}
+
+    /* ---- Panel de diagnóstico (el corazón del POC) ---- */
+    .diag{border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-bottom:22px}
+    .diag-head{display:flex;justify-content:space-between;align-items:center;
+      padding:12px 16px;background:var(--panel);border-bottom:1px solid var(--line)}
+    .diag-head strong{font-size:14px}
+    .mode{font-size:12px;padding:3px 9px;border-radius:20px;border:1px solid var(--line);color:var(--muted)}
+    .mode.live{color:var(--ok);border-color:var(--ok)}
+    .check{border-bottom:1px solid var(--line)}
+    .check:last-child{border-bottom:none}
+    .check-row{display:flex;align-items:center;gap:12px;padding:11px 16px;cursor:pointer}
+    .check-row:hover{background:#fafbfd}
+    .dot{width:11px;height:11px;border-radius:50%;background:var(--idle);flex:none;transition:background .2s}
+    .dot.ok{background:var(--ok)} .dot.warn{background:var(--warn)}
+    .dot.bad{background:var(--bad)} .dot.run{background:var(--accent);animation:pulse 1s infinite}
+    @keyframes pulse{50%{opacity:.35}}
+    .check-name{flex:1;font-weight:600}
+    .check-note{color:var(--muted);font-size:12.5px}
+    .check-body{display:none;padding:0 16px 14px 39px}
+    .check.open .check-body{display:block}
+    pre{background:#0f1621;color:#d6e2f0;border-radius:8px;padding:12px;overflow:auto;
+      font-family:var(--mono);font-size:12px;margin:6px 0 0;max-height:280px}
+    .btnrow{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 22px}
+    button{font:inherit;border:1px solid var(--line);background:#fff;color:var(--ink);
+      padding:8px 14px;border-radius:8px;cursor:pointer}
+    button:hover{border-color:var(--accent);color:var(--accent)}
+    button.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+    button:disabled{opacity:.5;cursor:not-allowed}
+
+    /* ---- Zona de tarjetas (tu grid real, con semáforos) ---- */
+    .tools{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:12px}
+    input[type=text],select{font:inherit;padding:7px 10px;border:1px solid var(--line);border-radius:8px}
+    input[type=text]{flex:1;min-width:200px}
+    .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
+    @media(max-width:760px){.grid{grid-template-columns:1fr}}
+    .card{border:1px solid var(--line);border-radius:10px;padding:13px 14px;background:#fff}
+    .card.red-border{border-color:var(--bad)}
+    .card h3{margin:0 0 1px;font-size:14px}
+    .card .adm{color:var(--muted);font-size:12px;margin:0 0 9px}
+    .sems{display:flex;gap:14px;margin-bottom:9px}
+    .sem{display:flex;align-items:center;gap:6px;font-size:12px}
+    .sem .d{width:10px;height:10px;border-radius:50%}
+    .sem.green .d{background:var(--ok)} .sem.amber .d{background:var(--warn)} .sem.red .d{background:var(--bad)}
+    .card .foot{color:var(--muted);font-size:11.5px;border-top:1px solid var(--line);padding-top:7px}
+    .pill{display:inline-block;font-size:10.5px;padding:2px 7px;border:1px solid var(--line);border-radius:20px;margin-right:5px}
+    .empty{color:var(--muted);padding:30px;text-align:center;border:1px dashed var(--line);border-radius:10px}
+
+    /* lista sortable de prueba */
+    #sortlist{list-style:none;padding:0;margin:6px 0 0;max-width:320px}
+    #sortlist li{border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin-bottom:6px;
+      background:#fff;cursor:grab;display:flex;align-items:center;gap:8px}
+    #sortlist li .grip{color:var(--idle)}
+    .sec-title{font-size:13px;font-weight:700;margin:26px 0 8px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>POC de migración · Visor de Tiendas → Creator</h1>
+  <p class="sub">Ejerce cada capacidad del SDK que necesitas para portar el Visor. Toca una fila para ver la respuesta cruda de tu entorno.</p>
+
+  <div class="diag">
+    <div class="diag-head">
+      <strong>Diagnóstico del entorno</strong>
+      <span id="modeBadge" class="mode">modo mock</span>
+    </div>
+    <div id="checks"></div>
+  </div>
+
+  <div class="btnrow">
+    <button id="btnRead" class="primary">Leer registros</button>
+    <button id="btnCreate">Probar creación (escribe 1 registro)</button>
+    <button id="btnUpdate">Probar actualización</button>
+    <button id="btnReload">Reiniciar diagnóstico</button>
+  </div>
+
+  <div class="sec-title">Datos renderizados (tarjetas + motor de semáforos)</div>
+  <div class="tools">
+    <input id="search" type="text" placeholder="Buscar merchant / admin…" />
+    <select id="fVentas">
+      <option value="">Ventas: todos</option>
+      <option value="red">Solo Dif. mensual roja</option>
+    </select>
+    <select id="fVisita">
+      <option value="">Visita: todos</option>
+      <option value="sin">Solo sin visita</option>
+    </select>
+  </div>
+  <div id="grid" class="grid"></div>
+
+  <div class="sec-title">Prueba de librería externa (SortableJS = tu field manager)</div>
+  <p class="check-note">Arrastra para reordenar. Si esto funciona, tus libs de terceros corren dentro del widget.</p>
+  <ul id="sortlist"></ul>
+</div>
+
+<script>
+/* ============================================================================
+   CONFIG — edita esto con los nombres reales de tu app en Creator.
+   Mientras MOCK sea true, todo corre con datos de ejemplo y no toca Creator.
+   Pon MOCK:false cuando quieras pegarle a datos reales (dentro de Creator).
+============================================================================ */
+const CONFIG = {
+  MOCK: true,
+
+  appName:        "TU_APP_LINKNAME",   // link name de la aplicación
+  tiendasReport:  "Tiendas_Report",    // link name del report para LEER tiendas
+  visitasForm:    "Visitas",           // link name del form para CREAR visitas
+  pageSize:       60,                  // igual que tu paginación por lotes
+
+  // Link names de los campos en tu report de Tiendas.
+  // (En Creator el "link name" del campo puede diferir de la etiqueta visible.)
+  fields: {
+    merchant:   "MERCHANT",
+    admin:      "ADMIN",
+    supervisor: "SUPERVISOR",
+    fpd7:       "FPD7",
+    fpd15:      "FPD15",
+    ventas:     "Dif_Mensual",
+    sinVisita:  "Sin_Visita"           // booleano/flag, ajústalo a tu esquema
+  },
+
+  // Para "Probar actualización": ID de un registro real y campo a tocar.
+  update: { recordId: "PON_UN_ID_AQUI", field: "MERCHANT", value: "EDITADO_POR_POC" }
+};
+
+/* ============================================================================
+   Motor de semáforos — MISMOS umbrales que tu Visor (fuente única).
+   Devuelve nivel + clase de color. No inventes: valida contra tu Sheet real.
+============================================================================ */
+function semaforo(tipo, v){
+  const n = Number(v);
+  if (v === "" || v === null || v === undefined || isNaN(n)) return {level:"—",cls:"amber"};
+  if (tipo === "fpd7")   return n < 15 ? g("Verde") : n <= 20 ? a("Ámbar") : b("Rojo");
+  if (tipo === "fpd15")  return n < 6  ? g("Verde") : n < 8  ? a("Ámbar") : b("Rojo");
+  if (tipo === "ventas") return n >= 0 ? g("Verde") : n >= -50 ? a("Ámbar") : b("Rojo");
+  return {level:"—",cls:"amber"};
+  function g(x){return{level:x,cls:"green"}} function a(x){return{level:x,cls:"amber"}} function b(x){return{level:x,cls:"red"}}
+}
+
+/* ============================================================================
+   Datos MOCK — para ver la UI de inmediato, sin Creator.
+============================================================================ */
+const MOCK_ROWS = [
+  {ID:"1", MERCHANT:"Bodega Central",   ADMIN:"Carla Ruiz",   SUPERVISOR:"J. Pérez", FPD7:"8",  FPD15:"4",  Dif_Mensual:"12",  Sin_Visita:false},
+  {ID:"2", MERCHANT:"Minimarket Sur",   ADMIN:"Luis Gómez",   SUPERVISOR:"J. Pérez", FPD7:"18", FPD15:"7",  Dif_Mensual:"-30", Sin_Visita:true},
+  {ID:"3", MERCHANT:"Tienda El Sol",    ADMIN:"Ana Torres",   SUPERVISOR:"M. Díaz",  FPD7:"25", FPD15:"9",  Dif_Mensual:"-70", Sin_Visita:false},
+  {ID:"4", MERCHANT:"Market Los Andes", ADMIN:"Pedro Salas",  SUPERVISOR:"M. Díaz",  FPD7:"12", FPD15:"5",  Dif_Mensual:"0",   Sin_Visita:true},
+  {ID:"5", MERCHANT:"Abarrotes Lima",   ADMIN:"Rosa Vega",    SUPERVISOR:"J. Pérez", FPD7:"14", FPD15:"6",  Dif_Mensual:"-55", Sin_Visita:false},
+  {ID:"6", MERCHANT:"Comercial Norte",  ADMIN:"Diego Ramos",  SUPERVISOR:"M. Díaz",  FPD7:"9",  FPD15:"3",  Dif_Mensual:"22",  Sin_Visita:false}
+];
+
+/* ============================================================================
+   Infraestructura del panel de diagnóstico.
+============================================================================ */
+const CHECKS = [
+  {id:"sdk",   name:"SDK cargado",                 note:"¿ZOHO.CREATOR presente?"},
+  {id:"init",  name:"init() del SDK",              note:"handshake con Creator"},
+  {id:"user",  name:"Sesión / usuario logueado",   note:"base de tu modelo de roles"},
+  {id:"params",name:"Query params de la página",   note:"para pasar contexto (prefill)"},
+  {id:"read",  name:"Leer registros (getAllRecords)", note:"tu tab Tiendas, paginado"},
+  {id:"create",name:"Crear registro (addRecord)",  note:"tu escritura de Visitas"},
+  {id:"update",name:"Actualizar registro (updateRecord)", note:"edición"},
+  {id:"lib",   name:"Librería externa (SortableJS)", note:"tu field manager drag-drop"},
+  {id:"render",name:"Render + semáforos",          note:"tarjetas desde datos"}
+];
+let lastRows = [];
+
+function renderChecks(){
+  document.getElementById("checks").innerHTML = CHECKS.map(c=>`
+    <div class="check" id="chk-${c.id}">
+      <div class="check-row" onclick="this.parentNode.classList.toggle('open')">
+        <span class="dot" id="dot-${c.id}"></span>
+        <span class="check-name">${c.name}</span>
+        <span class="check-note" id="note-${c.id}">${c.note}</span>
+      </div>
+      <div class="check-body"><pre id="pre-${c.id}">— sin ejecutar —</pre></div>
+    </div>`).join("");
+}
+function setCheck(id, state, note, payload){
+  const dot=document.getElementById("dot-"+id);
+  dot.className="dot "+state;
+  if(note!=null) document.getElementById("note-"+id).textContent=note;
+  if(payload!==undefined){
+    document.getElementById("pre-"+id).textContent =
+      typeof payload==="string" ? payload : JSON.stringify(payload,null,2);
+  }
+}
+
+/* ============================================================================
+   Runners — cada uno ejerce una capacidad y reporta al panel.
+   Todo con try/catch: el objetivo es que el panel NUNCA se rompa, solo reporte.
+============================================================================ */
+function sdkReady(){ return typeof ZOHO!=="undefined" && ZOHO && ZOHO.CREATOR; }
+
+async function runInit(){
+  setCheck("sdk","run","verificando…");
+  if(CONFIG.MOCK){ setCheck("sdk","warn","modo mock — SDK no requerido", "MOCK=true"); }
+  else if(sdkReady()){ setCheck("sdk","ok","ZOHO.CREATOR disponible", Object.keys(ZOHO.CREATOR)); }
+  else { setCheck("sdk","bad","SDK no cargó (¿fuera de Creator?)", "typeof ZOHO = "+typeof ZOHO); }
+
+  // init()
+  setCheck("init","run","llamando init()…");
+  if(CONFIG.MOCK){ setCheck("init","warn","omitido en mock","MOCK=true"); return null; }
+  if(!sdkReady()){ setCheck("init","bad","no hay SDK que inicializar"); return null; }
+  try{
+    const data = await ZOHO.CREATOR.init();
+    setCheck("init","ok","init() resolvió", data);
+    return data;
+  }catch(e){ setCheck("init","bad","init() falló", String(e)); return null; }
+}
+
+async function runUser(initData){
+  setCheck("user","run","obteniendo usuario…");
+  if(CONFIG.MOCK){ setCheck("user","warn","mock: usuario simulado", {loginUser:"demo@payjoy.com"}); return; }
+  try{
+    // Se intenta por varias vías porque el nombre exacto varía por versión.
+    let out = {};
+    if(ZOHO.CREATOR.UTIL && ZOHO.CREATOR.UTIL.getInitParams){
+      out.getInitParams = await ZOHO.CREATOR.UTIL.getInitParams();
+    }
+    if(initData) out.initData = initData;
+    const email = (out.getInitParams && out.getInitParams.loginUser)
+               || (initData && initData.loginUser) || null;
+    setCheck("user", email?"ok":"warn",
+      email ? ("usuario: "+email) : "revisa el JSON para el email real", out);
+  }catch(e){ setCheck("user","bad","no se pudo leer la sesión", String(e)); }
+}
+
+async function runParams(){
+  setCheck("params","run","leyendo query params…");
+  if(CONFIG.MOCK){ setCheck("params","warn","mock","{}"); return; }
+  try{
+    const p = ZOHO.CREATOR.UTIL.getQueryParams();
+    setCheck("params","ok","query params leídos", p);
+  }catch(e){ setCheck("params","bad","falló getQueryParams", String(e)); }
+}
+
+async function runRead(){
+  setCheck("read","run","leyendo registros…");
+  if(CONFIG.MOCK){
+    lastRows = MOCK_ROWS.slice();
+    setCheck("read","warn","mock: "+lastRows.length+" registros de ejemplo",
+      {mock:true, count:lastRows.length, primero:lastRows[0]});
+    renderGrid(); return;
+  }
+  if(!sdkReady()){ setCheck("read","bad","sin SDK"); return; }
+  try{
+    const config = { appName:CONFIG.appName, reportName:CONFIG.tiendasReport, page:1, pageSize:CONFIG.pageSize };
+    const resp = await ZOHO.CREATOR.API.getAllRecords(config);
+    const rows = (resp && resp.data) ? resp.data : [];
+    lastRows = rows;
+    setCheck("read","ok", rows.length+" registros (código "+((resp&&resp.code)||"?")+")",
+      {code:resp&&resp.code, count:rows.length, primero:rows[0]});
+    renderGrid();
+  }catch(e){ setCheck("read","bad","falló getAllRecords", String(e)); }
+}
+
+async function runCreate(){
+  setCheck("create","run","creando registro…");
+  const cbody = document.getElementById("chk-create"); cbody.classList.add("open");
+  if(CONFIG.MOCK){
+    setCheck("create","warn","mock: no se escribió nada (esto SÍ escribe en Creator real)",
+      {aviso:"Pon MOCK=false y define visitasForm para probar la escritura real."});
+    return;
+  }
+  if(!sdkReady()){ setCheck("create","bad","sin SDK"); return; }
+  try{
+    const config = {
+      appName: CONFIG.appName,
+      formName: CONFIG.visitasForm,
+      data: { data: { [CONFIG.fields.merchant]: "POC "+new Date().toISOString() } }
+    };
+    const resp = await ZOHO.CREATOR.API.addRecord(config);
+    setCheck("create", (resp&&resp.code===3000)?"ok":"warn",
+      "código "+((resp&&resp.code)||"?"), resp);
+  }catch(e){ setCheck("create","bad","falló addRecord", String(e)); }
+}
+
+async function runUpdate(){
+  setCheck("update","run","actualizando…");
+  document.getElementById("chk-update").classList.add("open");
+  if(CONFIG.MOCK){
+    setCheck("update","warn","mock: no se actualizó nada real",
+      {aviso:"Define CONFIG.update.recordId con un ID real y MOCK=false."});
+    return;
+  }
+  if(!sdkReady()){ setCheck("update","bad","sin SDK"); return; }
+  try{
+    const config = {
+      appName:CONFIG.appName, reportName:CONFIG.tiendasReport, id:CONFIG.update.recordId,
+      data:{ data:{ [CONFIG.update.field]: CONFIG.update.value } }
+    };
+    const resp = await ZOHO.CREATOR.API.updateRecord(config);
+    setCheck("update",(resp&&resp.code===3000)?"ok":"warn","código "+((resp&&resp.code)||"?"), resp);
+  }catch(e){ setCheck("update","bad","falló updateRecord", String(e)); }
+}
+
+function runLib(){
+  setCheck("lib","run","cargando SortableJS…");
+  const ul=document.getElementById("sortlist");
+  const items=["MERCHANT","ADMIN","FPD7","FPD15","Dif_Mensual","SUPERVISOR"];
+  ul.innerHTML=items.map(i=>`<li><span class="grip">⋮⋮</span>${i}</li>`).join("");
+  try{
+    if(typeof Sortable==="undefined"){ setCheck("lib","bad","Sortable no está definido"); return; }
+    Sortable.create(ul,{animation:150});
+    setCheck("lib","ok","SortableJS activo (arrastra la lista)", "Sortable v"+(Sortable.version||"?"));
+  }catch(e){ setCheck("lib","bad","falló al iniciar Sortable", String(e)); }
+}
+
+/* ============================================================================
+   Render de tarjetas + filtros (tu grid real).
+============================================================================ */
+function get(row, key){ return row[key] !== undefined ? row[key] : row[key.toLowerCase()] ; }
+
+function renderGrid(){
+  const q=(document.getElementById("search").value||"").toLowerCase();
+  const fV=document.getElementById("fVentas").value;
+  const fVis=document.getElementById("fVisita").value;
+  const F=CONFIG.fields;
+
+  let rows=lastRows.filter(r=>{
+    const merch=String(get(r,F.merchant)||"").toLowerCase();
+    const adm=String(get(r,F.admin)||"").toLowerCase();
+    if(q && !merch.includes(q) && !adm.includes(q)) return false;
+    if(fV==="red" && semaforo("ventas",get(r,F.ventas)).cls!=="red") return false;
+    if(fVis==="sin" && !truthy(get(r,F.sinVisita))) return false;
+    return true;
+  });
+
+  const grid=document.getElementById("grid");
+  if(!rows.length){ grid.innerHTML=`<div class="empty">Sin resultados. Usa "Leer registros" o ajusta los filtros.</div>`; setCheck("render","warn","0 tarjetas tras filtros"); return; }
+
+  grid.innerHTML=rows.map(r=>{
+    const s7=semaforo("fpd7",get(r,F.fpd7));
+    const s15=semaforo("fpd15",get(r,F.fpd15));
+    const sv=semaforo("ventas",get(r,F.ventas));
+    const sinVisita=truthy(get(r,F.sinVisita));
+    return `<div class="card ${sv.cls==="red"?"red-border":""}">
+      <h3>${esc(get(r,F.merchant))}</h3>
+      <p class="adm">${esc(get(r,F.admin))}</p>
+      ${sinVisita?'<span class="pill">Sin visita</span>':''}
+      <div class="sems">
+        <span class="sem ${s7.cls}"><span class="d"></span>FPD7 ${s7.level}</span>
+        <span class="sem ${s15.cls}"><span class="d"></span>FPD15 ${s15.level}</span>
+        <span class="sem ${sv.cls}"><span class="d"></span>Ventas ${sv.level}</span>
+      </div>
+      <div class="foot">Supervisor: ${esc(get(r,F.supervisor))}</div>
+    </div>`;
+  }).join("");
+  setCheck("render","ok",rows.length+" tarjetas renderizadas");
+}
+function truthy(v){ return v===true||v==="true"||v==="Sí"||v==="Si"||v==="1"||v===1; }
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+/* ============================================================================
+   Arranque.
+============================================================================ */
+async function boot(){
+  renderChecks();
+  document.getElementById("modeBadge").textContent = CONFIG.MOCK ? "modo mock" : "modo live";
+  document.getElementById("modeBadge").className = "mode " + (CONFIG.MOCK?"":"live");
+  const initData = await runInit();
+  await runUser(initData);
+  await runParams();
+  runLib();
+  await runRead();      // llena el grid (mock o real)
+}
+document.getElementById("btnReload").onclick = boot;
+document.getElementById("btnRead").onclick   = runRead;
+document.getElementById("btnCreate").onclick = runCreate;
+document.getElementById("btnUpdate").onclick = runUpdate;
+["search","fVentas","fVisita"].forEach(id=>document.getElementById(id).addEventListener("input",renderGrid));
+boot();
+</script>
+</body>
+</html>
