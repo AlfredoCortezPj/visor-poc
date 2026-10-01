@@ -4,7 +4,21 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Visor de Campo</title>
-<script src="https://js.zohostatic.com/creator/widgets/version/2.0/widgetsdk-min.js"></script>
+<script>
+(function(){
+  var urls = ["https://static.zohocdn.com/creator/widgets/version/2.0/widgetsdk-min.js", "https://js.zohostatic.com/creator/widgets/version/2.0/widgetsdk-min.js"];
+  window.VC_SDK = { intentos: [] };
+  function cargar(i){
+    if (i >= urls.length) return;
+    var s = document.createElement('script');
+    s.src = urls[i];
+    s.onload = function(){ VC_SDK.intentos.push(urls[i] + ' -> cargó'); };
+    s.onerror = function(){ VC_SDK.intentos.push(urls[i] + ' -> no cargó'); cargar(i + 1); };
+    document.head.appendChild(s);
+  }
+  cargar(0);
+})();
+</script>
 <script>
 /* =====================================================================
  * PUENTE  Zoho Creator  <->  Visor de Campo
@@ -1667,9 +1681,12 @@ function resumenSesion_() {
 
   /* ---------- precarga de la sesión ---------- */
   async function esperarSdk(){
-    for (var i = 0; i < 50 && !(window.ZOHO && ZOHO.CREATOR); i++) await new Promise(function(r){ setTimeout(r, 100); });
-    if (!(window.ZOHO && ZOHO.CREATOR))
-      throw new Error('No cargó el SDK de Zoho Creator. Esta página solo funciona abierta dentro de Creator (en la página del widget, en modo acceso).');
+    for (var i = 0; i < 100 && !(window.ZOHO && ZOHO.CREATOR); i++) await new Promise(function(r){ setTimeout(r, 100); });
+    if (!(window.ZOHO && ZOHO.CREATOR)){
+      var intentos = (window.VC_SDK && VC_SDK.intentos.length) ? VC_SDK.intentos.join(' | ') : 'sin respuesta';
+      throw new Error('No cargó el SDK de Zoho Creator. Esta página solo funciona abierta dentro de Creator ' +
+                      '(en la página del widget, en modo acceso). Detalle: ' + intentos);
+    }
     try { if (typeof ZOHO.CREATOR.init === 'function') await ZOHO.CREATOR.init(); } catch(_){}
     if (!ZOHO.CREATOR.DATA)
       throw new Error('El SDK de Creator cargó incompleto (partes: ' + Object.keys(ZOHO.CREATOR).join(', ') + ').');
