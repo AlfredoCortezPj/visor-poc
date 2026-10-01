@@ -1666,9 +1666,17 @@ function resumenSesion_() {
   }
 
   /* ---------- precarga de la sesión ---------- */
+  async function esperarSdk(){
+    for (var i = 0; i < 50 && !(window.ZOHO && ZOHO.CREATOR); i++) await new Promise(function(r){ setTimeout(r, 100); });
+    if (!(window.ZOHO && ZOHO.CREATOR))
+      throw new Error('No cargó el SDK de Zoho Creator. Esta página solo funciona abierta dentro de Creator (en la página del widget, en modo acceso).');
+    try { if (typeof ZOHO.CREATOR.init === 'function') await ZOHO.CREATOR.init(); } catch(_){}
+    if (!ZOHO.CREATOR.DATA)
+      throw new Error('El SDK de Creator cargó incompleto (partes: ' + Object.keys(ZOHO.CREATOR).join(', ') + ').');
+    return ZOHO.CREATOR;
+  }
   var LISTO = (async function(){
-    var Z = sdk(), t0 = Date.now();
-    try { if (typeof Z.init === 'function') await Z.init(); } catch(_){}
+    var t0 = Date.now(), Z = await esperarSdk();
     var ip = await Z.UTIL.getInitParams();
     C.SESION.email = String((ip && ip.loginUser) || '').trim().toLowerCase();
     DIAG.usuario = C.SESION.email;
