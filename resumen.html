@@ -1,0 +1,3338 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Visor de Campo · Resumen</title>
+<script>window.VC_MODULO = 'resumen';</script>
+<script>
+(function(){
+  var urls = ["https://static.zohocdn.com/creator/widgets/version/2.0/widgetsdk-min.js", "https://js.zohostatic.com/creator/widgets/version/2.0/widgetsdk-min.js"];
+  window.VC_SDK = { intentos: [] };
+  function cargar(i){
+    if (i >= urls.length) return;
+    var s = document.createElement('script');
+    s.src = urls[i];
+    s.onload = function(){ VC_SDK.intentos.push(urls[i] + ' -> cargó'); };
+    s.onerror = function(){ VC_SDK.intentos.push(urls[i] + ' -> no cargó'); cargar(i + 1); };
+    document.head.appendChild(s);
+  }
+  cargar(0);
+})();
+</script>
+<script>
+/* =====================================================================
+ * PUENTE  Zoho Creator  <->  Visor de Campo
+ * ---------------------------------------------------------------------
+ * Hace que el Index.html y el Código.gs originales funcionen dentro de un
+ * widget de Creator sin reescribirlos:
+ *   - Emula google.script.run (mismos nombres de función del servidor).
+ *   - Emula SpreadsheetApp / CacheService / Session / Utilities / Logger.
+ *   - La "hoja" vive en memoria y se llena desde los formularios VC_ de Creator.
+ *   - Las escrituras (roles y gestor de campos) se guardan de vuelta en Creator.
+ * ===================================================================== */
+
+/*CORE-START*/
+var VC_CORE = (function(){
+  'use strict';
+  var TZ = 'America/Lima';
+
+  /* ---------- tipado: Creator guarda todo como texto; la hoja tenía tipos ---------- */
+  function tipar(v){
+    if (v === null || v === undefined) return '';
+    if (typeof v !== 'string'){
+      if (typeof v === 'object') return (v.display_value != null) ? String(v.display_value) : JSON.stringify(v);
+      return v;
+    }
+    var t = v.trim();
+    if (t === '') return '';
+    var u = t.toUpperCase();
+    if (u === 'TRUE') return true;
+    if (u === 'FALSE') return false;
+    if (/^-?(0|[1-9]\d*)(\.\d+)?([eE][-+]?\d+)?$/.test(t)){
+      var dig = t.replace(/^-/, '').replace(/[eE].*$/, '').replace('.', '').replace(/^0+(?=\d)/, '');
+      if (dig.length <= 15) return Number(t);       // IDs largos (CRM) se quedan como texto
+    }
+    return v;
+  }
+
+  /* ---------- Utilities.formatDate ---------- */
+  function fmtFecha(date, tz, patron){
+    var d = (date instanceof Date) ? date : new Date(date);
+    if (isNaN(d.getTime())) return '';
+    var f = new Intl.DateTimeFormat('en-US', { timeZone: tz || TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', weekday: 'short' });
+    var p = {};
+    f.formatToParts(d).forEach(function(x){ p[x.type] = x.value; });
+    var dow = { Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6, Sun: 7 }[p.weekday];
+    var m = { yyyy: p.year, MM: p.month, dd: p.day, HH: (p.hour === '24' ? '00' : p.hour), mm: p.minute, ss: p.second,
+              M: String(Number(p.month)), d: String(Number(p.day)), u: String(dow) };
+    return String(patron).replace(/yyyy|MM|dd|HH|mm|ss|M|d|u/g, function(t){ return m[t]; });
+  }
+
+  /* ---------- valor de hoja -> texto para Creator ---------- */
+  function aTexto(v){
+    if (v === null || v === undefined) return '';
+    if (v instanceof Date) return fmtFecha(v, TZ, 'yyyy-MM-dd HH:mm:ss');
+    if (typeof v === 'boolean') return v ? 'TRUE' : 'FALSE';
+    return String(v);
+  }
+
+  function filaVacia(f){
+    if (!f) return true;
+    for (var i = 0; i < f.length; i++){ if (f[i] !== '' && f[i] !== null && f[i] !== undefined) return false; }
+    return true;
+  }
+
+  /* ---------- Hoja y Rango en memoria (subconjunto de SpreadsheetApp que usa Código.gs) ---------- */
+  function Hoja(nombre, filas){ this.nombre = nombre; this.filas = filas || []; this.sucia = false; }
+  Hoja.prototype.getName = function(){ return this.nombre; };
+  Hoja.prototype.getLastRow = function(){
+    var n = this.filas.length;
+    while (n > 0 && filaVacia(this.filas[n - 1])) n--;
+    return n;
+  };
+  Hoja.prototype.getLastColumn = function(){
+    var m = 0;
+    for (var r = 0; r < this.filas.length; r++){
+      var f = this.filas[r] || [];
+      for (var i = f.length; i > m; i--){ if (f[i - 1] !== '' && f[i - 1] !== null && f[i - 1] !== undefined){ m = i; break; } }
+    }
+    return m;
+  };
+  Hoja.prototype.getRange = function(r, c, nr, nc){ return new Rango(this, r, c, nr == null ? 1 : nr, nc == null ? 1 : nc); };
+  Hoja.prototype.getDataRange = function(){ return new Rango(this, 1, 1, Math.max(this.getLastRow(), 1), Math.max(this.getLastColumn(), 1)); };
+  Hoja.prototype.appendRow = function(arr){
+    this.filas.length = this.getLastRow();
+    this.filas.push((arr || []).slice());
+    this.sucia = true;
+    return this;
+  };
+  Hoja.prototype.deleteRow = function(r){ this.filas.splice(r - 1, 1); this.sucia = true; return this; };
+  Hoja.prototype.clearContents = function(){ this.filas = []; this.sucia = true; return this; };
+  Hoja.prototype.clear = Hoja.prototype.clearContents;
+
+  function Rango(h, r, c, nr, nc){ this.h = h; this.r = r; this.c = c; this.nr = nr; this.nc = nc; }
+  Rango.prototype.getValues = function(){
+    var out = [];
+    for (var i = 0; i < this.nr; i++){
+      var f = this.h.filas[this.r - 1 + i] || [], fila = [];
+      for (var j = 0; j < this.nc; j++){ var v = f[this.c - 1 + j]; fila.push(v === undefined || v === null ? '' : v); }
+      out.push(fila);
+    }
+    return out;
+  };
+  Rango.prototype.getDisplayValues = function(){ return this.getValues().map(function(f){ return f.map(function(v){ return aTexto(v); }); }); };
+  Rango.prototype.getValue = function(){ return this.getValues()[0][0]; };
+  Rango.prototype.setValues = function(m){
+    for (var i = 0; i < m.length; i++){
+      var idx = this.r - 1 + i;
+      while (this.h.filas.length <= idx) this.h.filas.push([]);
+      var f = this.h.filas[idx];
+      for (var j = 0; j < m[i].length; j++){
+        while (f.length < this.c - 1 + j) f.push('');
+        f[this.c - 1 + j] = m[i][j];
+      }
+    }
+    this.h.sucia = true;
+    return this;
+  };
+  Rango.prototype.setValue = function(v){ return this.setValues([[v]]); };
+  Rango.prototype.getRow = function(){ return this.r; };
+  Rango.prototype.getColumn = function(){ return this.c; };
+  Rango.prototype.createTextFinder = function(txt){
+    var rg = this, entera = false;
+    var tf = {
+      matchEntireCell: function(b){ entera = !!b; return tf; },
+      matchCase: function(){ return tf; },
+      findNext: function(){
+        var vals = rg.getValues(), t = String(txt).trim();
+        for (var i = 0; i < vals.length; i++){
+          for (var j = 0; j < vals[i].length; j++){
+            var s = String(vals[i][j]).trim();
+            if (entera ? s === t : s.indexOf(t) > -1) return new Rango(rg.h, rg.r + i, rg.c + j, 1, 1);
+          }
+        }
+        return null;
+      }
+    };
+    return tf;
+  };
+
+  /* ---------- libro (SpreadsheetApp.openById) ---------- */
+  var LIBRO = { hojas: {} };
+  var libroApi = {
+    getSheetByName: function(n){ return LIBRO.hojas[n] || null; },
+    getSheets: function(){ return Object.keys(LIBRO.hojas).map(function(k){ return LIBRO.hojas[k]; }); },
+    insertSheet: function(n){ var h = new Hoja(n, []); LIBRO.hojas[n] = h; return h; }
+  };
+  var SpreadsheetApp = { openById: function(){ return libroApi; }, getActiveSpreadsheet: function(){ return libroApi; } };
+
+  /* ---------- CacheService (memoria de la sesión) ---------- */
+  var CACHE = {};
+  var cacheApi = {
+    get: function(k){ var e = CACHE[k]; if (!e) return null; if (Date.now() > e.exp){ delete CACHE[k]; return null; } return e.v; },
+    put: function(k, v, ttl){ CACHE[k] = { v: String(v), exp: Date.now() + (ttl || 600) * 1000 }; },
+    remove: function(k){ delete CACHE[k]; }
+  };
+  var CacheService = { getScriptCache: function(){ return cacheApi; }, getUserCache: function(){ return cacheApi; } };
+  function limpiarCache(){ CACHE = {}; }
+
+  /* ---------- Session / Utilities / Logger ---------- */
+  var SESION = { email: '' };
+  var Session = {
+    getActiveUser: function(){ return { getEmail: function(){ return SESION.email; } }; },
+    getEffectiveUser: function(){ return { getEmail: function(){ return SESION.email; } }; },
+    getScriptTimeZone: function(){ return TZ; }
+  };
+  var Utilities = { formatDate: fmtFecha };
+  var Logger = { log: function(){ try { console.log.apply(console, arguments); } catch(e){} } };
+  var HtmlService = {};
+
+  return { tipar: tipar, aTexto: aTexto, fmtFecha: fmtFecha, filaVacia: filaVacia, Hoja: Hoja, LIBRO: LIBRO,
+           SESION: SESION, limpiarCache: limpiarCache,
+           shims: { SpreadsheetApp: SpreadsheetApp, CacheService: CacheService, Session: Session,
+                    Utilities: Utilities, Logger: Logger, HtmlService: HtmlService } };
+})();
+
+/* Código.gs original, encapsulado: sus funciones no chocan con las del Index.html. */
+var VC_SERVER = (function(SpreadsheetApp, CacheService, Session, Utilities, Logger, HtmlService){
+/**
+ * Visor de Tiendas — PayJoy (roles + baja lógica + optimizado)
+ *
+ * SEGURIDAD: la app se implementa "Ejecutar como: yo". Cada función sensible
+ * valida en el servidor el rol del usuario autenticado.
+ *
+ * CARGA UNIFICADA: getBootstrap() lee la pestaña Tiendas UNA sola vez y, sobre
+ * ese mismo array, arma tanto las tarjetas (getStores) como el Resumen
+ * (getResumen). Devuelve { stores, resumen } y cachea la salida ya procesada
+ * por alcance. Visitas se mantiene aparte (getVisitas).
+ */
+
+// ============ CONFIGURACIÓN ============
+const CONFIG = {
+  SHEET_ID:   '1HIu01Iz43z4ZF0x2ISEZj0_05K7UxLfLlUvR02Ql1PM',
+  SHEET_NAME: 'Tiendas',
+  EMAIL_COL:  'EJECUTIVO',
+  TITLE_COL:  'MERCHANT',
+  CARD_COLS:  ['ADMIN', 'EJECUTIVO', 'MANAGER', 'HABILITADO', 'PROCEDENCIA'],
+
+  // --- Roles ---
+  USERS_SHEET:      'USUARIOS',
+  USERS_EMAIL:      'CORREO',
+  USERS_ROLE:       'ROL',
+  USERS_ESTADO:     'ESTADO',
+  MAESTRO_FALLBACK: 'alfredo.cortez@payjoy.com',
+
+  // --- Gestión de campos del detalle ---
+  CAMPOS_SHEET:     'CONFIG_CAMPOS',
+  CALCULADOS_SHEET: 'CONFIG_CALCULADOS',
+
+  // --- Visitas ---
+  VISITAS_SHEET:    'Visitas'
+};
+
+const ROLES_VALIDOS = ['usuario', 'admin', 'supervisor', 'maestro'];
+const USERS_HEADERS = ['CORREO', 'ROL', 'ESTADO', 'EQUIPO', 'SUPERVISOR', 'FECHA_ALTA', 'FECHA_BAJA', 'NOTAS'];
+const CAMPOS_HEADERS = ['COLUMNA', 'ETIQUETA', 'EN_DETALLE', 'ORDEN', 'FORMATO', 'PROTEGIDA'];
+const FORMATOS_VALIDOS = ['TEXTO', 'ENTERO', 'DECIMAL', 'PORCENTAJE', 'FECHA'];
+const CALCULADOS_HEADERS = ['CLAVE', 'TIPO', 'ORIGEN', 'DEFINICION'];
+const TIPOS_CALCULADOS = ['semaforo', 'semaforo_inv', 'concatenado', 'formula'];
+
+// Columnas que la TARJETA necesita de 'Tiendas'. (Referencia. La lectura
+// unificada de getBootstrap lee el ancho completo porque el Resumen requiere
+// columnas extra —cuotas, activada, con_cupo—; ambas partes trabajan sobre
+// el mismo array leído una sola vez.)
+const CARD_SOURCE_COLS = [
+  'MERCHANTID','MERCHANTNAME','ADMINID','ADMINNAME','PROCEDENCIA','HABILITADO',
+  'TIPO_TIENDA','EJECUTIVO','MANAGER','VENTA_TOTAL','VENTA_R_1','DIF_REL',
+  'VISITAS','FFPD7_LAST30D','VFPD7_LAST30D','FFPD15_LAST4W','VFPD15_LAST4W'
+];
+
+// --- Umbrales de semáforos ---
+// FPD7/FPD15/Dif. mensual ya NO viven aquí: salen de recetas de CONFIG_CALCULADOS
+// (una sola fuente de verdad para tarjeta y detalle). Aquí queda solo lo que sigue en código.
+const SEM = {
+  BADGE_VISITAS: true        // pon en false para ocultar el badge "Sin visita"
+};
+
+function numOrNull_(x){
+  if (x === null || x === undefined) return null;
+  var s = String(x).trim().replace('%','').replace(/,/g,'');
+  if (s === '') return null;
+  var n = parseFloat(s);
+  return isNaN(n) ? null : n;
+}
+
+/* ---------- normalización case-insensitive ----------
+ * Todo lookup de columna pasa por aquí: encuentra la data sin importar si el
+ * encabezado está en mayúsculas, minúsculas o combinado (ej. "Visitas"). */
+function norm_(s){ return String(s == null ? '' : s).trim().toUpperCase(); }
+
+// EJECUTIVO<->PAYJOYOWNER, MANAGER<->SUPERVISOR: cualquier lookup por el nombre viejo o el nuevo funciona.
+var COL_ALIASES = { 'PAYJOYOWNER':'EJECUTIVO', 'EJECUTIVO':'PAYJOYOWNER', 'SUPERVISOR':'MANAGER', 'MANAGER':'SUPERVISOR' };
+function applyAliases_(m){
+  Object.keys(COL_ALIASES).forEach(function(a){ var b = COL_ALIASES[a]; if (m[a] === undefined && m[b] !== undefined) m[a] = m[b]; });
+  return m;
+}
+function headerIndexMap_(headers){
+  var m = {};
+  headers.forEach(function(h, i){ m[norm_(h)] = i; });
+  return applyAliases_(m);
+}
+function idx_(map, name){ var i = map[norm_(name)]; return (i === undefined) ? -1 : i; }
+
+function toBool_(v){
+  if (v === true) return true;
+  if (v === false || v === null || v === undefined || v === '') return false;
+  var s = String(v).trim().toUpperCase();
+  return s === 'TRUE' || s === 'VERDADERO' || s === 'SI' || s === 'SÍ' || s === '1' || s === 'X';
+}
+// =======================================
+
+function doGet() {
+  return HtmlService.createTemplateFromFile('Index')
+    .evaluate()
+    .setTitle('Visor de Tiendas')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+/* ---------- helpers ---------- */
+function ss_() { return SpreadsheetApp.openById(CONFIG.SHEET_ID); }
+
+function activeEmail_() {
+  return (Session.getActiveUser().getEmail() || '').trim().toLowerCase();
+}
+
+function mainSheet_() {
+  const sh = ss_().getSheetByName(CONFIG.SHEET_NAME);
+  if (!sh) {
+    const disp = ss_().getSheets().map(function (s) { return s.getName(); });
+    throw new Error('No se encontró la pestaña "' + CONFIG.SHEET_NAME + '". Disponibles: ' + disp.join(' | '));
+  }
+  return sh;
+}
+
+/* ---------- roles ---------- */
+function ensureUsersSheet_() {
+  const ss = ss_();
+  var sh = ss.getSheetByName(CONFIG.USERS_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(CONFIG.USERS_SHEET);
+    sh.appendRow(USERS_HEADERS);
+  }
+  return sh;
+}
+
+/** Lee USUARIOS y la cachea 90s. Case-insensitive en los encabezados. */
+function readUsers_() {
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get('USERS_CFG');
+  if (hit) return JSON.parse(hit);
+
+  var sh = ensureUsersSheet_();
+  var values = sh.getDataRange().getValues();
+  var H = headerIndexMap_(values[0]);
+  var eIdx = idx_(H, CONFIG.USERS_EMAIL);
+  var rIdx = idx_(H, CONFIG.USERS_ROLE);
+  var sIdx = idx_(H, CONFIG.USERS_ESTADO);
+  var map = {}, list = [];
+  for (var i = 1; i < values.length; i++) {
+    var e = String(values[i][eIdx]).trim().toLowerCase();
+    if (!e) continue;
+    var rol = String(values[i][rIdx]).trim().toLowerCase();
+    var estado = (sIdx > -1 && String(values[i][sIdx]).trim()) ? String(values[i][sIdx]).trim().toUpperCase() : 'ACTIVO';
+    map[e] = { rol: rol, estado: estado };
+    list.push({ correo: e, rol: rol, estado: estado });
+  }
+  var out = { map: map, list: list };
+  cache.put('USERS_CFG', JSON.stringify(out), 90); // 90s; se limpia al cambiar/dar de baja
+  return out;
+}
+function clearUsersCache_(){ CacheService.getScriptCache().remove('USERS_CFG'); }
+
+function roleOf_(email){
+  if (!email) return 'sin_acceso';
+  if (email === CONFIG.MAESTRO_FALLBACK.trim().toLowerCase()) return 'maestro';
+  var u = readUsers_().map[email];
+  if (u){ if (u.estado === 'BAJA') return 'baja'; return u.rol; }        // en la lista
+  if (/@(payjoy\.com|ext\.payjoy\.com)$/.test(email)) return 'solicitar'; // dominio válido, sin alta
+  return 'sin_acceso';
+}
+function hasAccess_(rol){ return ['maestro','admin','supervisor','usuario'].indexOf(String(rol||'').toLowerCase()) > -1; }
+
+function requireMaestro_() {
+  const email = activeEmail_();
+  if (roleOf_(email) !== 'maestro') throw new Error('Acción no permitida: se requiere rol maestro.');
+  return email;
+}
+
+/* ---------- CONFIG_CAMPOS (gobierna el detalle) ---------- */
+
+/** Lee CONFIG_CAMPOS y la cachea 60s. Devuelve {map (por clave normalizada), order (claves ordenadas por ORDEN)}. */
+function readCampos_(){
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get('CAMPOS_CFG');
+  if (hit) return JSON.parse(hit);
+
+  var sh = ss_().getSheetByName(CONFIG.CAMPOS_SHEET);
+  var map = {}, order = [];
+  if (sh && sh.getLastRow() >= 2){
+    var values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+    var H = headerIndexMap_(values[0]);
+    var iCol = idx_(H,'COLUMNA'), iEt = idx_(H,'ETIQUETA'), iDet = idx_(H,'EN_DETALLE'),
+        iOrd = idx_(H,'ORDEN'),   iFmt = idx_(H,'FORMATO'), iProt = idx_(H,'PROTEGIDA');
+    for (var i = 1; i < values.length; i++){
+      var col = norm_(values[i][iCol]);
+      if (!col) continue;
+      map[col] = {
+        etiqueta:  iEt  > -1 ? String(values[i][iEt]).trim() : '',
+        enDetalle: iDet > -1 ? toBool_(values[i][iDet]) : false,
+        orden:     iOrd > -1 ? (numOrNull_(values[i][iOrd]) || 0) : 0,
+        formato:   iFmt > -1 ? String(values[i][iFmt]).trim() : 'TEXTO',
+        protegida: iProt > -1 ? toBool_(values[i][iProt]) : false
+      };
+      order.push(col);
+    }
+  }
+  order.sort(function(a,b){ return map[a].orden - map[b].orden; });
+  var out = { map: map, order: order };
+  cache.put('CAMPOS_CFG', JSON.stringify(out), 60); // 60s; se limpia al guardar desde el gestor
+  return out;
+}
+function clearCamposCache_(){ CacheService.getScriptCache().remove('CAMPOS_CFG'); }
+
+/* ---------- CONFIG_CALCULADOS (recetas de campos calculados) ---------- */
+
+function ensureCalculadosSheet_(){
+  var ss = ss_();
+  var sh = ss.getSheetByName(CONFIG.CALCULADOS_SHEET);
+  if (!sh){
+    sh = ss.insertSheet(CONFIG.CALCULADOS_SHEET);
+    sh.appendRow(CALCULADOS_HEADERS);
+  }
+  return sh;
+}
+
+/** Lee CONFIG_CALCULADOS SIN cache. Devuelve {map (por clave normalizada), order}. */
+function readCalculadosRaw_(){
+  var sh = ss_().getSheetByName(CONFIG.CALCULADOS_SHEET);
+  var map = {}, order = [];
+  if (sh && sh.getLastRow() >= 2){
+    var values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+    var H = headerIndexMap_(values[0]);
+    var iC = idx_(H,'CLAVE'), iT = idx_(H,'TIPO'), iO = idx_(H,'ORIGEN'), iD = idx_(H,'DEFINICION');
+    for (var i = 1; i < values.length; i++){
+      var clave = String(values[i][iC] == null ? '' : values[i][iC]).trim();
+      if (!clave) continue;
+      var defRaw = iD > -1 ? String(values[i][iD] == null ? '' : values[i][iD]) : '';
+      var def = null, err = '';
+      if (defRaw){ try { def = JSON.parse(defRaw); } catch(e){ err = 'json'; } }
+      var k = norm_(clave);
+      map[k] = {
+        clave:      clave,
+        tipo:       iT > -1 ? String(values[i][iT]).trim().toLowerCase() : '',
+        origen:     iO > -1 ? String(values[i][iO]).trim() : '',
+        definicion: def || {},
+        error:      err
+      };
+      order.push(k);
+    }
+  }
+  return { map: map, order: order };
+}
+
+/** Versión cacheada (60s) para el render de tarjeta y detalle. */
+function readCalculados_(){
+  var cache = CacheService.getScriptCache();
+  var hit = cache.get('CALC_CFG');
+  if (hit) return JSON.parse(hit);
+  var out = readCalculadosRaw_();
+  cache.put('CALC_CFG', JSON.stringify(out), 60);
+  return out;
+}
+function clearCalculadosCache_(){ CacheService.getScriptCache().remove('CALC_CFG'); }
+
+/** Motor de semáforo: mismo cálculo para tarjeta y detalle (una sola fuente de verdad).
+ *  num = valor crudo (fracción, ej. 0.06). `sensible` decide el texto:
+ *    sensible=true  -> banda/rango (esconde el número, ej. FPD)
+ *    sensible=false -> valor exacto (ej. DIF_REL). El color siempre sale de los cortes.
+ *  Devuelve { txt, sem }. */
+function semaforoRender_(num, def, tipo, sensible){
+  if (num === null || num === undefined) return { txt: 's/d', sem: 'na' };
+  var unidad = (def && def.unidad) ? String(def.unidad).toLowerCase() : 'porcentaje';
+  var esPct = (unidad === 'porcentaje');
+  var vp = esPct ? num * 100 : num;
+  var suf = esPct ? '%' : '';
+  var valorTxt = esPct ? ((Math.round(vp * 10) / 10) + suf) : String(Math.round(vp));
+  var c1 = (def && def.corte1 != null) ? Number(def.corte1) : null;
+  var c2 = (def && def.corte2 != null) ? Number(def.corte2) : null;
+  if (c1 === null || c2 === null) return { txt: valorTxt, sem: 'na' };
+  var bucket, banda;
+  if (vp < c1)       { bucket = 'low';  banda = '< ' + c1 + suf; }
+  else if (vp <= c2) { bucket = 'mid';  banda = c1 + '\u2013' + c2 + suf; }
+  else               { bucket = 'high'; banda = '> ' + c2 + suf; }
+  var sem;
+  if (tipo === 'semaforo_inv') sem = (bucket === 'low') ? 'bad' : (bucket === 'mid') ? 'warn' : 'ok';
+  else                         sem = (bucket === 'low') ? 'ok'  : (bucket === 'mid') ? 'warn' : 'bad';
+  return { txt: (sensible ? banda : valorTxt), sem: sem };
+}
+
+/* ===== Motor de fórmulas seguro (sin eval). Soporta columnas, números,
+ * + - * / ( ) y comparadores > >= < <= == != (comparación => 1/0). ===== */
+var _FORMULA_CACHE = {};
+function _formulaTree_(expr){ if (!_FORMULA_CACHE[expr]) _FORMULA_CACHE[expr] = parseFormula_(expr); return _FORMULA_CACHE[expr]; }
+
+function tokenizeFormula_(expr){
+  var toks = [], i = 0, s = String(expr), two = { '>=':1,'<=':1,'==':1,'!=':1 };
+  while (i < s.length){
+    var c = s[i];
+    if (c === ' ' || c === '\t'){ i++; continue; }
+    if (two[s.substr(i,2)]){ toks.push({t:'op',v:s.substr(i,2)}); i += 2; continue; }
+    if ('+-*/()<>'.indexOf(c) > -1){ toks.push({t:'op',v:c}); i++; continue; }
+    if (/[0-9.]/.test(c)){ var j=i; while (j<s.length && /[0-9.]/.test(s[j])) j++; toks.push({t:'num',v:parseFloat(s.substring(i,j))}); i=j; continue; }
+    if (/[A-Za-z_]/.test(c)){ var k=i; while (k<s.length && /[A-Za-z0-9_]/.test(s[k])) k++; toks.push({t:'id',v:s.substring(i,k)}); i=k; continue; }
+    throw new Error('Caracter no válido: "' + c + '"');
+  }
+  return toks;
+}
+function parseFormula_(expr){
+  var toks = tokenizeFormula_(expr), pos = 0;
+  function peek(){ return toks[pos]; } function eat(){ return toks[pos++]; }
+  function primary(){ var tk = peek(); if (!tk) throw new Error('Fórmula incompleta.');
+    if (tk.t==='op' && tk.v==='('){ eat(); var e=comparison(); var r=eat(); if(!r||r.v!==')') throw new Error('Falta ")".'); return e; }
+    if (tk.t==='op' && tk.v==='-'){ eat(); return {k:'neg',a:primary()}; }
+    if (tk.t==='num'){ eat(); return {k:'num',v:tk.v}; }
+    if (tk.t==='id'){ eat(); return {k:'col',v:tk.v}; }
+    throw new Error('Token inesperado: ' + tk.v); }
+  function term(){ var a=primary(); while(peek() && peek().t==='op' && (peek().v==='*'||peek().v==='/')){ var op=eat().v; a={k:op,a:a,b:primary()}; } return a; }
+  function arith(){ var a=term(); while(peek() && peek().t==='op' && (peek().v==='+'||peek().v==='-')){ var op=eat().v; a={k:op,a:a,b:term()}; } return a; }
+  function comparison(){ var a=arith(); if(peek() && peek().t==='op' && ['>','>=','<','<=','==','!='].indexOf(peek().v)>-1){ var op=eat().v; a={k:'cmp',op:op,a:a,b:arith()}; } return a; }
+  var tree = comparison(); if (pos < toks.length) throw new Error('Sobra al final: ' + toks[pos].v); return tree;
+}
+function formulaCols_(node, acc){ acc = acc || []; if (!node) return acc; if (node.k==='col'){ acc.push(node.v); return acc; } formulaCols_(node.a,acc); formulaCols_(node.b,acc); return acc; }
+function evalFormulaNode_(node, getCol){
+  switch(node.k){
+    case 'num': return node.v;
+    case 'col': return numOrNull_(getCol(node.v));
+    case 'neg': { var a=evalFormulaNode_(node.a,getCol); return a==null?null:-a; }
+    case '+': case '-': case '*': case '/': {
+      var x=evalFormulaNode_(node.a,getCol), y=evalFormulaNode_(node.b,getCol);
+      if (x==null||y==null) return null;
+      if (node.k==='+') return x+y; if (node.k==='-') return x-y; if (node.k==='*') return x*y;
+      return y===0 ? null : x/y; }
+    case 'cmp': { var l=evalFormulaNode_(node.a,getCol), r=evalFormulaNode_(node.b,getCol); if (l==null||r==null) return null;
+      switch(node.op){ case '>':return l>r?1:0; case '>=':return l>=r?1:0; case '<':return l<r?1:0; case '<=':return l<=r?1:0; case '==':return l===r?1:0; case '!=':return l!==r?1:0; } }
+  }
+  throw new Error('Nodo desconocido');
+}
+function computeFormula_(expr, row, HM){ if (!expr) return null; return evalFormulaNode_(_formulaTree_(expr), function(name){ var i=idx_(HM,name); return i>-1 ? row[i] : ''; }); }
+
+// Devuelve el valor numérico de un origen, sea columna real o campo 'formula' (encadenado un nivel).
+function resolveOrigenNum_(origen, row, HM, calcData){
+  var i = idx_(HM, origen);
+  if (i > -1) return numOrNull_(row[i]);
+  var c = (calcData && calcData.map) ? calcData.map[norm_(origen)] : null;
+  if (c && c.tipo === 'formula' && c.definicion) return computeFormula_(c.definicion.formula, row, HM);
+  return null;
+}
+
+/** ¿La columna es sensible (PROTEGIDA=true en CONFIG_CAMPOS)? Default: no sensible. */
+function esSensible_(campos, colName){
+  var c = campos.map[norm_(colName)];
+  return c ? !!c.protegida : false;
+}
+
+/** Aplica una receta calculada sobre una fila de datos. Devuelve { v, sem? }. */
+function computeCalculado_(calc, row, HM, sensible, calcData){
+  var tipo = String(calc.tipo || '').toLowerCase();
+  var def = calc.definicion || {};
+  if (tipo === 'concatenado'){
+    var cols = (def.columnas && def.columnas.length) ? def.columnas : (calc.origen ? [calc.origen] : []);
+    var sep = (def.separador != null) ? String(def.separador) : ' - ';
+    var parts = [];
+    for (var i = 0; i < cols.length; i++){ var ci = idx_(HM, cols[i]); if (ci < 0) continue; var s = String(row[ci] == null ? '' : row[ci]).trim(); if (s) parts.push(s); }
+    return { v: parts.join(sep) };
+  }
+  if (tipo === 'formula'){ var val = computeFormula_(def.formula, row, HM); return { v: val == null ? '\u2014' : val }; }
+  // semaforo / semaforo_inv: el origen puede ser columna real O un campo 'formula'
+  var num = resolveOrigenNum_(calc.origen, row, HM, calcData);
+  if (num === null){ var oi = idx_(HM, calc.origen); if (oi < 0 && !(calcData && calcData.map && calcData.map[norm_(calc.origen)])) return { v: '\u2014', sem: 'na' }; }
+  var r = semaforoRender_(num, def, tipo, sensible);
+  return { v: r.txt, sem: r.sem };
+}
+
+/** Busca la receta de semáforo (normal o invertido) cuyo ORIGEN sea la columna dada. */
+function findSemCalcByOrigen_(calcData, origenCol){
+  var o = norm_(origenCol);
+  for (var k in calcData.map){
+    var c = calcData.map[k];
+    if ((c.tipo === 'semaforo' || c.tipo === 'semaforo_inv') && norm_(c.origen) === o) return c;
+  }
+  return null;
+}
+
+/** Formatea un valor para el detalle según FORMATO. */
+function formatVal_(v, formato){
+  if (v === null || v === undefined || v === '') return '';
+  switch (norm_(formato)){
+    case 'PORCENTAJE': { var p = numOrNull_(v); return p === null ? String(v) : (Math.round(p*1000)/10) + '%'; }
+    case 'DECIMAL':    { var d = numOrNull_(v); return d === null ? String(v) : (Math.round(d*100)/100); }
+    case 'ENTERO':     { var e = numOrNull_(v); return e === null ? String(v) : Math.round(e); }
+    case 'FECHA':
+      if (v instanceof Date) return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd HH:mm');
+      return String(v);
+    default: return String(v); // TEXTO
+  }
+}
+
+/* ---------- API para el frontend ---------- */
+
+function fuse_(a, b) {
+  a = String(a == null ? '' : a).trim();
+  b = String(b == null ? '' : b).trim();
+  return (a && b) ? (a + ' - ' + b) : (a || b);
+}
+
+/* ================================================================
+ * ============  CARGA UNIFICADA (una sola lectura)  ==============
+ * ================================================================
+ * getBootstrap lee las ~10k filas de Tiendas UNA vez y en esa misma pasada
+ * arma dos cosas sobre el mismo array:
+ *   - stores  : idéntico a lo que devolvía getStores (tarjetas)
+ *   - resumen : idéntico a lo que devolvía getResumen (KPIs + seguimiento + críticas)
+ * Cachea la salida ya procesada por alcance (rol + correo + viewAs), 3 min.
+ * Ejecutivo/supervisor: paquete chico -> cachea -> 2ª carga instantánea.
+ * Maestro: paquete grande -> el put puede exceder el límite y no cachear (ok,
+ * es una sola llamada por sesión de todos modos). */
+function getBootstrap(viewAsEmail){
+  var caller = activeEmail_();
+  var callerRole = roleOf_(caller);
+
+  var vkey = viewAsEmail ? String(viewAsEmail).trim().toLowerCase() : '';
+  var cache = CacheService.getScriptCache();
+  var ckey = 'BOOT2_' + callerRole + '|' + caller + '|' + vkey;
+  var hit = cache.get(ckey);
+  if (hit){ try { return JSON.parse(hit); } catch(e){} }
+
+  // ---- Lectura ÚNICA de Tiendas (encabezados + filas, ancho completo) ----
+  var sheet = mainSheet_();
+  var lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  var headers = getHeadersCached_(sheet, lastCol);
+  var HM = headerIndexMap_(headers);
+  var values = (lastRow >= 2) ? sheet.getRange(2, 1, lastRow - 1, lastCol).getValues() : [];
+
+  var out = {
+    stores:  _buildStores_(caller, callerRole, viewAsEmail, headers, values, HM),
+    resumen: _buildResumen_(caller, callerRole, viewAsEmail, values, HM)
+  };
+
+  try { cache.put(ckey, JSON.stringify(out), 180); } catch (e){}  // 3 min
+  return out;
+}
+
+// Envoltorios de compatibilidad: si algo aún llama a getStores/getResumen
+// sueltos, siguen funcionando y reusan la MISMA lectura (vía la caché).
+function getStores(viewAsEmail){ return getBootstrap(viewAsEmail).stores; }
+function getResumen(viewAsEmail){ return getBootstrap(viewAsEmail).resumen; }
+
+/* ---------- Constructor de TIENDAS (sobre un array ya leído) ---------- */
+function _buildStores_(caller, callerRole, viewAsEmail, headers, values, HM){
+  if (!hasAccess_(callerRole))
+    return { email: caller, role: callerRole, viewingAs: null, viewingRole: callerRole, config: publicConfig(), rows: [] };
+
+  var scopeOwner = null, scopeSup = null, impersonating = null, viewingRole = callerRole;
+  if (callerRole === 'usuario')         scopeOwner = caller;
+  else if (callerRole === 'supervisor') scopeSup = caller;
+
+  if (viewAsEmail) {
+    var t = String(viewAsEmail).trim().toLowerCase();
+    if (callerRole === 'maestro') {
+      var tr = roleOf_(t);
+      scopeOwner = null; scopeSup = null; impersonating = t; viewingRole = tr;
+      if (tr === 'usuario')         scopeOwner = t;
+      else if (tr === 'supervisor') scopeSup = t;
+      else if (!hasAccess_(tr))
+        return { email: caller, role: callerRole, viewingAs: t, viewingRole: tr, config: publicConfig(), rows: [] };
+    } else if (callerRole === 'supervisor') {
+      scopeOwner = t; scopeSup = caller; impersonating = t; viewingRole = 'usuario';
+    }
+  }
+
+  var base = { email: caller, role: callerRole, viewingAs: impersonating, viewingRole: viewingRole, config: publicConfig(), rows: [] };
+  if (!values.length) return base;
+
+  var iOwner = idx_(HM, CONFIG.EMAIL_COL);
+  if (iOwner === -1) throw new Error('No existe la columna "' + CONFIG.EMAIL_COL + '". Encontradas: ' + headers.join(' | '));
+  var iSup=idx_(HM,'MANAGER'), iProc=idx_(HM,'PROCEDENCIA'), iHab=idx_(HM,'HABILITADO'), iTipo=idx_(HM,'TIPO_TIENDA');
+  var iMid=idx_(HM,'MERCHANTID'), iMn=idx_(HM,'MERCHANTNAME'), iAid=idx_(HM,'ADMINID'), iAn=idx_(HM,'ADMINNAME');
+  var iVT=idx_(HM,'VENTA_TOTAL'), iVR1=idx_(HM,'VENTA_R_1'), iDif=idx_(HM,'DIF_REL'), iVis=idx_(HM,'VISITAS');
+
+  // Recetas de semáforo (una sola fuente de verdad, compartida con el detalle).
+  var calcData = readCalculados_();
+  var calcF7  = findSemCalcByOrigen_(calcData, 'FPD7');
+  var calcF15 = findSemCalcByOrigen_(calcData, 'FPD15');
+  var calcDif = findSemCalcByOrigen_(calcData, 'DIF_REL');
+  // Sensibilidad de cada origen (decide banda vs valor exacto).
+  var campos = readCampos_();
+  var sensF7  = esSensible_(campos, 'FPD7');   // sensible -> banda
+  var sensF15 = esSensible_(campos, 'FPD15');  // sensible -> banda
+  var sensDif = esSensible_(campos, 'DIF_REL');        // no sensible -> valor exacto
+
+  var rows = [];
+  for (var r = 0; r < values.length; r++) {
+    var v = values[r];
+    if (scopeOwner !== null && String(v[iOwner]).trim().toLowerCase() !== scopeOwner) continue;
+    if (scopeSup   !== null && (iSup < 0 || String(v[iSup]).trim().toLowerCase() !== scopeSup)) continue;
+
+    var f7  = resolveOrigenNum_('FPD7',  v, HM, calcData);
+    var f15 = resolveOrigenNum_('FPD15', v, HM, calcData);
+    var vt  = numOrNull_(iVT  > -1 ? v[iVT]  : '');
+    var dif = numOrNull_(iDif > -1 ? v[iDif] : '');
+    var vis = numOrNull_(iVis > -1 ? v[iVis] : '');
+    var tipo = iTipo > -1 ? String(v[iTipo]).trim() : '';
+
+    // Dif. mensual: semáforo sobre DIF_REL (valor exacto, porque DIF_REL no es sensible).
+    var difSem = calcDif
+      ? semaforoRender_(dif, calcDif.definicion, calcDif.tipo, sensDif)
+      : { txt: (dif === null ? 's/d' : String(Math.round(dif))), sem: 'na' };
+
+    rows.push({
+      _row: r + 2,
+      merchant: fuse_(iMid > -1 ? v[iMid] : '', iMn > -1 ? v[iMn] : ''),
+      admin:    fuse_(iAid > -1 ? v[iAid] : '', iAn > -1 ? v[iAn] : ''),
+      owner:       iOwner > -1 ? v[iOwner] : '',
+      supervisor:  iSup  > -1 ? v[iSup]  : '',
+      procedencia: iProc > -1 ? v[iProc] : '',
+      habilitado:  iHab  > -1 ? String(v[iHab]).trim() : '',
+      tipo: tipo,
+      churn: tipo.toUpperCase() === 'CHURN',
+      ventaMes: vt === null ? '\u2014' : String(Math.round(vt)),   // "Ventas": solo valor, sin color
+      dif:  difSem,                                                 // "Dif. mensual": semáforo
+      fpd7:  calcF7  ? semaforoRender_(f7,  calcF7.definicion,  calcF7.tipo,  sensF7)  : { txt: 's/d', sem: 'na' },
+      fpd15: calcF15 ? semaforoRender_(f15, calcF15.definicion, calcF15.tipo, sensF15) : { txt: 's/d', sem: 'na' },
+      borde: difSem.sem === 'bad',       // borde rojo si Dif. mensual está en rojo
+      sinVisita: SEM.BADGE_VISITAS && vis === 0
+    });
+  }
+  base.rows = rows;
+  return base;
+}
+
+/* ---------- Vendedores por tienda (pestaña Clerks, empaquetada en JSON) ---------- */
+
+/** Normaliza un id para comparar parejo (280461.0 -> 280461). */
+function normId_(v){
+  if (v === null || v === undefined) return '';
+  return String(v).trim().replace(/\.0+$/, '');
+}
+
+/** Lee UNA fila de Clerks por merchantid (TextFinder, sin cargar toda la pestaña)
+ *  y arma la lista de vendedores. El semáforo de FPD7 reusa la receta de
+ *  CONFIG_CALCULADOS (misma fuente de verdad que la tarjeta y el detalle). */
+function clerksForMerchant_(merchantId){
+  merchantId = normId_(merchantId);
+  if (!merchantId) return [];
+  var sh = ss_().getSheetByName('Clerks');
+  if (!sh) return [];
+  var last = sh.getLastRow();
+  if (last < 2) return [];
+
+  var head = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+  var H = headerIndexMap_(head);
+  var cMid  = idx_(H, 'MERCHANT_ID');
+  var cJson = idx_(H, 'CLERKS');
+  if (cMid < 0 || cJson < 0) return [];
+
+  var cell = sh.getRange(2, cMid + 1, last - 1, 1)
+               .createTextFinder(merchantId).matchEntireCell(true).findNext();
+  if (!cell) return [];
+
+  var raw = sh.getRange(cell.getRow(), cJson + 1).getValue();
+  var arr = [];
+  try { arr = raw ? JSON.parse(raw) : []; } catch (e){ arr = []; }
+
+  var calcData = readCalculados_();
+  var calcF7   = findSemCalcByOrigen_(calcData, 'FPD7');
+  var campos   = readCampos_();
+  var sensF7   = esSensible_(campos, 'FPD7');   // misma sensibilidad que el FPD7 de la tienda
+  var meId = merchantId;  // el de la tienda abierta, ya normalizado arriba
+  
+  return arr.map(function(c){
+    var num = (c.FPD7 === null || c.FPD7 === undefined || c.FPD7 === '') ? null : Number(c.FPD7);
+    var r = calcF7
+      ? semaforoRender_(num, calcF7.definicion, calcF7.tipo, sensF7)
+      : { txt: (num === null ? 's/d' : (Math.round(num * 1000) / 10) + '%'), sem: 'na' };
+    var nombre = String(c.nombre == null ? '' : c.nombre).trim() || '\u2014\u2014\u2014';
+    var actual = normId_(c.actual);
+    var movido = (actual && actual !== meId) ? actual : '';   // vacío si sigue aquí
+    return { nombre: nombre, und: c.und || 0, sem: r.sem, mora: r.txt,
+             activo: (c.activo === undefined ? true : !!c.activo), movido: movido };
+  });
+}
+
+/** Detalle de una tienda gobernado por CONFIG_CAMPOS. Revalida permisos. */
+function getStoreDetail(rowNumber, viewAsEmail) {
+  rowNumber = parseInt(rowNumber, 10);
+  if (!rowNumber || rowNumber < 2) throw new Error('Fila inválida.');
+
+  var caller = activeEmail_();
+  var callerRole = roleOf_(caller);
+  if (!hasAccess_(callerRole)) throw new Error('Sin acceso.');
+
+  var sheet = mainSheet_();
+  var lastCol = sheet.getLastColumn();
+  var headers = getHeadersCached_(sheet, lastCol);
+  var HM = headerIndexMap_(headers);
+  var iOwner = idx_(HM, CONFIG.EMAIL_COL);
+  var iSup   = idx_(HM, 'MANAGER');
+  var row = sheet.getRange(rowNumber, 1, 1, lastCol).getValues()[0];
+  var rowOwner = iOwner > -1 ? String(row[iOwner]).trim().toLowerCase() : '';
+  var rowSup   = iSup   > -1 ? String(row[iSup]).trim().toLowerCase()   : '';
+
+  var t = viewAsEmail ? String(viewAsEmail).trim().toLowerCase() : null;
+  var allowed = false;
+  if (callerRole === 'admin' || callerRole === 'maestro') {
+    if (t && callerRole === 'maestro') {
+      var tr = roleOf_(t);
+      if (tr === 'admin' || tr === 'maestro') allowed = true;
+      else if (tr === 'supervisor') allowed = (rowSup === t);
+      else if (tr === 'usuario')    allowed = (rowOwner === t);
+    } else allowed = true;
+  } else if (callerRole === 'supervisor') {
+    allowed = t ? (rowOwner === t && rowSup === caller) : (rowSup === caller);
+  } else { // usuario
+    allowed = (rowOwner === caller);
+  }
+  if (!allowed) throw new Error('No autorizado para ver esta tienda.');
+
+  // Valores de apoyo (título y botón Zoho), independientes de la config.
+  var zohoAccountId = '', midId = '', midName = '';
+  for (var c = 0; c < headers.length; c++){
+    var nh = norm_(headers[c]);
+    if (nh === 'ZOHO_ACCOUNT_ID') zohoAccountId = row[c];
+    else if (nh === 'MERCHANTID') midId = row[c];
+    else if (nh === 'MERCHANTNAME') midName = row[c];
+  }
+
+  var clerks = clerksForMerchant_(midId);   // vendedores de esta tienda
+
+  var campos = readCampos_();            // { map, order }
+  var calculados = readCalculados_();    // { map, order }
+  var fields = [];
+
+  if (!campos.order || !campos.order.length){
+    // Red de seguridad: sin config, muestra todas las columnas reales.
+    for (var c2 = 0; c2 < headers.length; c2++){
+      fields.push({ k: headers[c2], v: formatVal_(row[c2], 'TEXTO') });
+    }
+    return { title: fuse_(midId, midName) || 'Detalle', fields: fields, zohoAccountId: zohoAccountId, clerks: clerks };
+  }
+
+  // La config manda el orden y la visibilidad. Cada fila es columna real o calculada.
+  for (var i = 0; i < campos.order.length; i++){
+    var clave = campos.order[i];
+    var cfg = campos.map[clave];
+    if (!cfg || !cfg.enDetalle) continue;
+
+    var ih = idx_(HM, clave);
+    if (ih > -1){
+      // columna real de Tiendas
+      fields.push({ k: cfg.etiqueta || headers[ih], v: formatVal_(row[ih], cfg.formato) });
+    } else if (calculados.map[clave]){
+      // campo calculado: se resuelve con su receta. El display (banda vs valor) depende
+      // de si su columna origen es sensible (PROTEGIDA) en CONFIG_CAMPOS.
+      var calc = calculados.map[clave];
+      var sens = calc.origen ? esSensible_(campos, calc.origen) : false;
+      var out = computeCalculado_(calc, row, HM, sens, calculados);
+      var f = { k: cfg.etiqueta || calc.clave, v: out.v };
+      if (out.sem) f.sem = out.sem;
+      fields.push(f);
+    }
+    // si no es ni real ni calculada => huérfana => no se muestra
+  }
+
+  return { title: fuse_(midId, midName) || 'Detalle', fields: fields, zohoAccountId: zohoAccountId, clerks: clerks };
+}
+
+/** Cachea los encabezados de la hoja de tiendas (evita una lectura por click). */
+function getHeadersCached_(sheet, lastCol) {
+  const cache = CacheService.getScriptCache();
+  const key = 'HDRS_' + CONFIG.SHEET_NAME + '_' + lastCol;   // cambia si cambia el nº de columnas
+  const hit = cache.get(key);
+  if (hit) return JSON.parse(hit);
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function (h) { return String(h).trim(); });
+  cache.put(key, JSON.stringify(headers), 120); // 2 min: un rename se refleja pronto sin leer de más
+  return headers;
+}
+
+function publicConfig() {
+  return { TITLE_COL: CONFIG.TITLE_COL, CARD_COLS: CONFIG.CARD_COLS };
+}
+
+/** Solo maestro: lista de usuarios y roles. Incluye siempre al maestro fijo. */
+function getAdminData() {
+  requireMaestro_();
+  const users = readUsers_();
+  const mf = CONFIG.MAESTRO_FALLBACK.trim().toLowerCase();
+  const list = users.list.slice();
+  if (!users.map[mf]) list.unshift({ correo: mf, rol: 'maestro', estado: 'ACTIVO' });
+  return { roles: list, rolesValidos: ROLES_VALIDOS, maestro: mf };
+}
+
+/** Solo maestro: crea o actualiza el rol de un correo. */
+function setUserRole(email, role) {
+  requireMaestro_();
+  email = String(email || '').trim().toLowerCase();
+  role  = String(role || '').trim().toLowerCase();
+  if (!email) throw new Error('Correo vacío.');
+  if (ROLES_VALIDOS.indexOf(role) === -1) throw new Error('Rol inválido: ' + role);
+
+  var sh = ensureUsersSheet_();
+  var values = sh.getDataRange().getValues();
+  var H = headerIndexMap_(values[0]);
+  var eIdx = idx_(H, CONFIG.USERS_EMAIL);
+  var rIdx = idx_(H, CONFIG.USERS_ROLE);
+  for (var i = 1; i < values.length; i++) {
+    if (String(values[i][eIdx]).trim().toLowerCase() === email) {
+      sh.getRange(i + 1, rIdx + 1).setValue(role);
+      clearUsersCache_();
+      return getAdminData();
+    }
+  }
+  var headers = values[0].map(function (h) { return String(h).trim(); });
+  sh.appendRow(headers.map(function (h) {
+    var nh = norm_(h);
+    if (nh === norm_(CONFIG.USERS_EMAIL))  return email;
+    if (nh === norm_(CONFIG.USERS_ROLE))   return role;
+    if (nh === norm_(CONFIG.USERS_ESTADO)) return 'ACTIVO';
+    if (nh === 'FECHA_ALTA')               return new Date();
+    return '';
+  }));
+  clearUsersCache_();
+  return getAdminData();
+}
+
+function getSupervisorUsers() {
+  var caller = activeEmail_();
+  var role = roleOf_(caller);
+  if (role !== 'supervisor' && role !== 'maestro') throw new Error('Requiere rol supervisor.');
+
+  var sheet = mainSheet_();
+  var lastRow = sheet.getLastRow(), lastCol = sheet.getLastColumn();
+  var headers = getHeadersCached_(sheet, lastCol);
+  var HM = headerIndexMap_(headers);
+  var iOwner = idx_(HM, CONFIG.EMAIL_COL);
+  var iSup   = idx_(HM, 'MANAGER');
+  var set = {};
+  if (lastRow >= 2 && iSup > -1) {
+    // Solo necesita EJECUTIVO y MANAGER (columnas iniciales): acota la lectura.
+    var readCols = Math.max(iOwner, iSup) + 1;
+    var values = sheet.getRange(2, 1, lastRow - 1, (readCols > 0 ? readCols : lastCol)).getValues();
+    for (var r = 0; r < values.length; r++) {
+      if (String(values[r][iSup]).trim().toLowerCase() === caller) {
+        var o = String(values[r][iOwner]).trim().toLowerCase();
+        if (o) set[o] = true;
+      }
+    }
+  }
+  var list = Object.keys(set).sort().map(function (e) { return { correo: e }; });
+  return { mode: 'supervisor', roles: list };
+}
+
+/** Solo maestro: da de BAJA a un usuario (baja lógica, no borra la fila). */
+function removeUser(email) {
+  requireMaestro_();
+  email = String(email || '').trim().toLowerCase();
+  if (email === CONFIG.MAESTRO_FALLBACK.trim().toLowerCase())
+    throw new Error('No puedes dar de baja al maestro principal.');
+  var sh = ensureUsersSheet_();
+  var values = sh.getDataRange().getValues();
+  var H = headerIndexMap_(values[0]);
+  var eIdx  = idx_(H, CONFIG.USERS_EMAIL);
+  var sIdx  = idx_(H, CONFIG.USERS_ESTADO);
+  var fbIdx = idx_(H, 'FECHA_BAJA');
+  for (var i = 1; i < values.length; i++) {
+    if (String(values[i][eIdx]).trim().toLowerCase() === email) {
+      if (sIdx  > -1) sh.getRange(i + 1, sIdx + 1).setValue('BAJA');
+      if (fbIdx > -1) sh.getRange(i + 1, fbIdx + 1).setValue(new Date());
+      break;
+    }
+  }
+  clearUsersCache_();
+  return { ok: true };
+}
+
+/* ---------- Gestor de campos (edita CONFIG_CAMPOS desde la app) ---------- */
+
+function ensureCamposSheet_(){
+  var ss = ss_();
+  var sh = ss.getSheetByName(CONFIG.CAMPOS_SHEET);
+  if (!sh){
+    sh = ss.insertSheet(CONFIG.CAMPOS_SHEET);
+    sh.appendRow(CAMPOS_HEADERS);
+  }
+  return sh;
+}
+
+/** Lee CONFIG_CAMPOS SIN cache (el gestor debe ver el estado real, no el cacheado). */
+function readCamposRaw_(){
+  var sh = ensureCamposSheet_();
+  var map = {}, order = [];
+  if (sh.getLastRow() >= 2){
+    var values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+    var H = headerIndexMap_(values[0]);
+    var iCol=idx_(H,'COLUMNA'), iEt=idx_(H,'ETIQUETA'), iDet=idx_(H,'EN_DETALLE'),
+        iOrd=idx_(H,'ORDEN'), iFmt=idx_(H,'FORMATO'), iProt=idx_(H,'PROTEGIDA');
+    for (var i=1;i<values.length;i++){
+      var col = norm_(values[i][iCol]);
+      if (!col) continue;
+      map[col] = {
+        original:  String(values[i][iCol] == null ? '' : values[i][iCol]).trim(),
+        etiqueta:  iEt  > -1 ? String(values[i][iEt]).trim() : '',
+        enDetalle: iDet > -1 ? toBool_(values[i][iDet]) : false,
+        orden:     iOrd > -1 ? (numOrNull_(values[i][iOrd]) || 0) : 0,
+        formato:   iFmt > -1 ? (String(values[i][iFmt]).trim() || 'TEXTO') : 'TEXTO',
+        protegida: iProt > -1 ? toBool_(values[i][iProt]) : false
+      };
+      order.push(col);
+    }
+  }
+  return { map: map, order: order };
+}
+
+/** Solo maestro: estado del gestor = cruce de headers reales x CONFIG_CAMPOS x CONFIG_CALCULADOS. */
+function getCamposManager(){
+  requireMaestro_();
+  var sheet = mainSheet_();
+  var lastCol = sheet.getLastColumn();
+  // Headers FRESH (sin cache) para que una columna recién agregada aparezca de una.
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h){ return String(h).trim(); });
+  var headSet = {}; headers.forEach(function(h){ headSet[norm_(h)] = h; });
+
+  var cfg  = readCamposRaw_();       // { map, order }
+  var calc = readCalculadosRaw_();   // { map, order }
+
+  function isHeader(k){ return headSet[k] !== undefined; }
+  function isCalc(k){ return calc.map[k] !== undefined; }
+  // Alerta de receta: JSON inválido, u origen que ya no existe en Tiendas.
+  function alertaCalc(k){
+    var cc = calc.map[k]; if (!cc) return '';
+    if (cc.error === 'json') return 'receta inválida';
+    if (cc.tipo === 'formula'){
+      try { var cols = formulaCols_(parseFormula_(cc.definicion.formula));
+        for (var i=0;i<cols.length;i++){ if (!isHeader(norm_(cols[i]))) return 'columna no encontrada: ' + cols[i]; }
+      } catch(e){ return 'fórmula inválida'; }
+      return '';
+    }
+    if (cc.tipo === 'semaforo' || cc.tipo === 'semaforo_inv'){
+      if (cc.origen && !isHeader(norm_(cc.origen)) && !calc.map[norm_(cc.origen)]) return 'origen no encontrado: ' + cc.origen;
+      return '';
+    }
+    if (cc.origen && !isHeader(norm_(cc.origen))) return 'origen no encontrado: ' + cc.origen;
+    return '';
+  }
+  function displayName(k){ return isHeader(k) ? headSet[k] : (isCalc(k) ? calc.map[k].clave : k); }
+
+  var items = [], enConfig = {};
+
+  // 1) En config (columna real o calculada), en su ORDEN.
+  var pres = cfg.order.filter(function(k){ return isHeader(k) || isCalc(k); });
+  pres.sort(function(a,b){ return cfg.map[a].orden - cfg.map[b].orden; });
+  pres.forEach(function(k){
+    var m = cfg.map[k];
+    enConfig[k] = true;
+    items.push({ columna: displayName(k), etiqueta: m.etiqueta, enDetalle: m.enDetalle,
+                 formato: m.formato, protegida: m.protegida,
+                 estado: isCalc(k) ? 'calculado' : 'ok', alerta: isCalc(k) ? alertaCalc(k) : '' });
+  });
+
+  // 2) Columnas reales nuevas (en Tiendas, sin config). Default oculto/TEXTO.
+  headers.forEach(function(h){
+    if (!enConfig[norm_(h)]){
+      items.push({ columna: h, etiqueta: '', enDetalle: false,
+                   formato: 'TEXTO', protegida: false, estado: 'nueva', alerta: '' });
+    }
+  });
+
+  // 3) Calculados nuevos (existe la receta, aún no están en la config).
+  calc.order.forEach(function(k){
+    if (!enConfig[k]){
+      items.push({ columna: calc.map[k].clave, etiqueta: '', enDetalle: false,
+                   formato: 'TEXTO', protegida: false, estado: 'calculado_nuevo', alerta: alertaCalc(k) });
+    }
+  });
+
+  // 4) Huérfanas: en config, ni columna real ni calculado. El maestro decide.
+  //    Pista de origen por convención de nombre (calculado = tiene minúscula/espacio; columna real = MAYÚSCULAS_CON_GUION).
+  cfg.order.forEach(function(k){
+    if (!isHeader(k) && !isCalc(k)){
+      var m = cfg.map[k];
+      var pareceCalc = /[a-z ]/.test(m.original || '');
+      items.push({ columna: (m.original || k), etiqueta: m.etiqueta, enDetalle: m.enDetalle,
+                   formato: m.formato, protegida: m.protegida, estado: 'huerfana',
+                   sub: pareceCalc ? 'calculado' : 'columna', alerta: '' });
+    }
+  });
+
+  return {
+    items: items,
+    formatos: FORMATOS_VALIDOS,
+    columnasReales: headers,
+    tipos: TIPOS_CALCULADOS,
+    unidades: ['porcentaje', 'numero'],
+    recetas: calc.order.map(function(k){
+      var c = calc.map[k];
+      return { clave: c.clave, tipo: c.tipo, origen: c.origen, definicion: c.definicion };
+    })
+  };
+}
+
+/** Solo maestro: reescribe CONFIG_CAMPOS con el orden y valores recibidos del gestor. */
+function saveCampos(items){
+  requireMaestro_();
+  if (!items || !items.length) throw new Error('No hay campos para guardar.');
+  var sh = ensureCamposSheet_();
+
+  var rows = [CAMPOS_HEADERS.slice()];
+  for (var i=0;i<items.length;i++){
+    var it = items[i] || {};
+    var col = String(it.columna == null ? '' : it.columna).trim();
+    if (!col) continue;
+    var fmt = norm_(it.formato);
+    if (FORMATOS_VALIDOS.indexOf(fmt) === -1) fmt = 'TEXTO';
+    rows.push([ col,
+                String(it.etiqueta == null ? '' : it.etiqueta).trim(),
+                it.enDetalle ? true : false,
+                (i + 1) * 10,               // ORDEN renumerado según la posición de arrastre
+                fmt,
+                it.protegida ? true : false ]);
+  }
+
+  sh.clearContents();
+  sh.getRange(1, 1, rows.length, CAMPOS_HEADERS.length).setValues(rows);
+  clearCamposCache_();
+  return getCamposManager();
+}
+
+/* ---------- Gestor de campos calculados (crear/editar/borrar recetas) ---------- */
+
+/** Encabezados reales de Tiendas (fresh). */
+function calcHeaders_(){
+  var sheet = mainSheet_();
+  var lastCol = sheet.getLastColumn();
+  return sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h){ return String(h).trim(); });
+}
+
+/** Agrega una fila oculta en CONFIG_CAMPOS para la clave dada, si aún no existe. */
+function ensureCampoRow_(clave){
+  var sh = ensureCamposSheet_();
+  var values = sh.getDataRange().getValues();
+  var H = headerIndexMap_(values[0]);
+  var iCol = idx_(H,'COLUMNA'), iEt = idx_(H,'ETIQUETA'), iDet = idx_(H,'EN_DETALLE'),
+      iOrd = idx_(H,'ORDEN'), iFmt = idx_(H,'FORMATO'), iProt = idx_(H,'PROTEGIDA');
+  var maxOrd = 0;
+  for (var r = 1; r < values.length; r++){
+    if (norm_(values[r][iCol]) === norm_(clave)) return; // ya existe
+    var o = numOrNull_(values[r][iOrd]); if (o !== null && o > maxOrd) maxOrd = o;
+  }
+  var width = values[0].length, row = [];
+  for (var k = 0; k < width; k++) row[k] = '';
+  if (iCol  > -1) row[iCol]  = clave;
+  if (iDet  > -1) row[iDet]  = false;
+  if (iOrd  > -1) row[iOrd]  = maxOrd + 10;
+  if (iFmt  > -1) row[iFmt]  = 'TEXTO';
+  if (iProt > -1) row[iProt] = false;
+  sh.appendRow(row);
+}
+
+/** Solo maestro: crea o edita una receta en CONFIG_CALCULADOS. Valida tipo, origen y cortes. */
+function saveCalculado(payload){
+  requireMaestro_();
+  payload = payload || {};
+  var clave = String(payload.clave == null ? '' : payload.clave).trim();
+  var claveOrig = String(payload.claveOriginal == null ? '' : payload.claveOriginal).trim();
+  var tipo = String(payload.tipo || '').trim().toLowerCase();
+  if (!clave) throw new Error('El nombre interno (clave) es obligatorio.');
+  if (TIPOS_CALCULADOS.indexOf(tipo) === -1) throw new Error('Tipo inválido: ' + tipo);
+
+  var headers = calcHeaders_();
+  var HS = {}; headers.forEach(function(h){ HS[norm_(h)] = true; });
+  function esColReal(name){ return HS[norm_(name)] === true; }
+  var calcNow = readCalculadosRaw_();
+  function esFormulaClave(name){ var c = calcNow.map[norm_(name)]; return !!(c && c.tipo === 'formula'); }
+
+  var def = {}, origen = '';
+  if (tipo === 'concatenado'){
+    var cols = (payload.columnas || []).map(function(c){ return String(c || '').trim(); }).filter(function(c){ return c; });
+    if (!cols.length) throw new Error('Elige al menos una columna para concatenar.');
+    for (var i = 0; i < cols.length; i++){ if (!esColReal(cols[i])) throw new Error('La columna "' + cols[i] + '" no existe en Tiendas.'); }
+    def = { columnas: cols, separador: (payload.separador == null) ? ' - ' : String(payload.separador) }; origen = cols[0];
+  } else if (tipo === 'formula'){
+    var expr = String(payload.formula || '').trim();
+    if (!expr) throw new Error('Escribe la fórmula.');
+    var tree; try { tree = parseFormula_(expr); } catch(e){ throw new Error('Fórmula inválida: ' + e.message); }
+    var fcols = formulaCols_(tree);
+    for (var f = 0; f < fcols.length; f++){ if (!esColReal(fcols[f])) throw new Error('La columna "' + fcols[f] + '" no existe en Tiendas.'); }
+    def = { formula: expr }; origen = fcols[0] || '';
+  } else { // semaforo / semaforo_inv
+    origen = String(payload.origen || '').trim();
+    if (!esColReal(origen) && !esFormulaClave(origen)) throw new Error('El origen "' + origen + '" no es una columna real ni un campo calculado.');
+    var unidad = String(payload.unidad || 'porcentaje').trim().toLowerCase();
+    if (unidad !== 'porcentaje' && unidad !== 'numero') unidad = 'porcentaje';
+    var c1 = numOrNull_(payload.corte1), c2 = numOrNull_(payload.corte2);
+    if (c1 === null || c2 === null) throw new Error('Los dos cortes son obligatorios y numéricos.');
+    if (c1 >= c2) throw new Error('El corte verde→ámbar debe ser menor que el corte ámbar→rojo.');
+    def = { unidad: unidad, corte1: c1, corte2: c2 };
+  }
+
+  var sh = ensureCalculadosSheet_();
+  var values = sh.getDataRange().getValues();
+  var H = headerIndexMap_(values[0]);
+  var iC = idx_(H,'CLAVE'), iT = idx_(H,'TIPO'), iO = idx_(H,'ORIGEN'), iD = idx_(H,'DEFINICION');
+
+  if (tipo === 'semaforo' || tipo === 'semaforo_inv'){
+    for (var d = 1; d < values.length; d++){
+      var dt = String(values[d][iT]).trim().toLowerCase(), dclave = String(values[d][iC]).trim();
+      if ((dt === 'semaforo' || dt === 'semaforo_inv') && norm_(values[d][iO]) === norm_(origen) && norm_(dclave) !== norm_(claveOrig))
+        throw new Error('Ya existe un semáforo para "' + origen + '" (' + dclave + '). Edítalo en vez de crear otro.');
+    }
+  }
+  var editing = false, rowIdx = -1;
+  if (claveOrig){ for (var r = 1; r < values.length; r++){ if (norm_(values[r][iC]) === norm_(claveOrig)){ editing = true; rowIdx = r; break; } } }
+  if (editing){
+    sh.getRange(rowIdx + 1, iT + 1).setValue(tipo);
+    sh.getRange(rowIdx + 1, iO + 1).setValue(origen);
+    sh.getRange(rowIdx + 1, iD + 1).setValue(JSON.stringify(def));
+  } else {
+    for (var r2 = 1; r2 < values.length; r2++){ if (norm_(values[r2][iC]) === norm_(clave)) throw new Error('Ya existe un calculado con ese nombre.'); }
+    if (esColReal(clave)) throw new Error('El nombre choca con una columna real de Tiendas. Usa otro.');
+    var width = values[0].length, newRow = []; for (var k = 0; k < width; k++) newRow[k] = '';
+    if (iC > -1) newRow[iC] = clave; if (iT > -1) newRow[iT] = tipo; if (iO > -1) newRow[iO] = origen; if (iD > -1) newRow[iD] = JSON.stringify(def);
+    sh.appendRow(newRow); ensureCampoRow_(clave);
+  }
+  clearCalculadosCache_(); clearCamposCache_();
+  return getCamposManager();
+}
+
+/** Solo maestro: borra la receta. La fila en CONFIG_CAMPOS queda huérfana a propósito. */
+function deleteCalculado(clave){
+  requireMaestro_();
+  clave = String(clave || '').trim();
+  if (!clave) throw new Error('Clave vacía.');
+  var sh = ensureCalculadosSheet_();
+  var values = sh.getDataRange().getValues();
+  var H = headerIndexMap_(values[0]);
+  var iC = idx_(H,'CLAVE');
+  for (var r = values.length - 1; r >= 1; r--){
+    if (norm_(values[r][iC]) === norm_(clave)){ sh.deleteRow(r + 1); break; }
+  }
+  clearCalculadosCache_();
+  return getCamposManager();
+}
+
+/* ---------- Módulo de Visitas (agenda semanal dinámica: ayer + hoy + 5 días) ---------- */
+
+/** Normaliza una fecha (Date o texto) a clave 'yyyy-MM-dd'. */
+function toDayKey_(v, tz){
+  if (v === null || v === undefined || v === '') return '';
+  if (Object.prototype.toString.call(v) === '[object Date]') return Utilities.formatDate(v, tz, 'yyyy-MM-dd');
+  var s = String(v).trim();
+  var m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  var m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);      // dd/mm/yyyy
+  if (m2){ return m2[3] + '-' + ('0'+m2[2]).slice(-2) + '-' + ('0'+m2[1]).slice(-2); }
+  return '';
+}
+
+/** Visitas de la semana, con alcance por rol igual que Tiendas. */
+function getVisitas(viewAsEmail){
+  var caller = activeEmail_();
+  var callerRole = roleOf_(caller);
+  var tz = Session.getScriptTimeZone();
+  var DIAS  = ['', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb', 'Dom'];   // por 'u' (1=Lun..7=Dom)
+  var MESES = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+
+  var hoy = new Date();
+  var keys = {}, days = [];
+  for (var i = -1; i <= 5; i++){
+    var dd = new Date(hoy.getFullYear(), hoy.getMonth(), hoy.getDate() + i);
+    var key = Utilities.formatDate(dd, tz, 'yyyy-MM-dd');
+    var u   = Number(Utilities.formatDate(dd, tz, 'u'));
+    var dnum = Utilities.formatDate(dd, tz, 'd');
+    var mi  = Number(Utilities.formatDate(dd, tz, 'M'));
+    var obj = { fecha: key, label: DIAS[u] + ' ' + dnum + ' ' + MESES[mi-1], esHoy: (i === 0), visitas: [] };
+    keys[key] = obj; days.push(obj);
+  }
+  var base = { email: caller, role: callerRole, days: days };
+  if (!hasAccess_(callerRole)) return base;
+
+  // Alcance por rol (mismo criterio que getStores): usuario -> EJECUTIVO, supervisor -> MANAGER.
+  var scopeEje = null, scopeMgr = null;
+  if (callerRole === 'usuario')         scopeEje = caller;
+  else if (callerRole === 'supervisor') scopeMgr = caller;
+
+  // "Ver como" (impersonación), idéntico a Tiendas.
+  if (viewAsEmail){
+    var t = String(viewAsEmail).trim().toLowerCase();
+    if (callerRole === 'maestro'){
+      var tr = roleOf_(t);
+      scopeEje = null; scopeMgr = null;
+      if (tr === 'usuario')         scopeEje = t;
+      else if (tr === 'supervisor') scopeMgr = t;
+      else if (!hasAccess_(tr))     return base;   // sin acceso
+      // admin/maestro impersonado -> todas (ambos null)
+    } else if (callerRole === 'supervisor'){
+      scopeEje = t; scopeMgr = caller;              // solo un ejecutivo suyo
+    }
+  }
+
+  var sh = ss_().getSheetByName(CONFIG.VISITAS_SHEET);
+  if (!sh || sh.getLastRow() < 2) return base;
+  var values = sh.getRange(1, 1, sh.getLastRow(), sh.getLastColumn()).getValues();
+  var H = headerIndexMap_(values[0]);
+  var iId=idx_(H,'ID_INTERACCION'), iMgr=idx_(H,'MANAGER'), iEje=idx_(H,'EJECUTIVO'),
+      iMn=idx_(H,'MERCHANTNAME'), iMid=idx_(H,'MERCHANTID'), iTipo=idx_(H,'TIPO_DE_VISITA'),
+      iFec=idx_(H,'FECHA_PROGRAMADA'), iEst=idx_(H,'Estado');
+
+  for (var r = 1; r < values.length; r++){
+    var row = values[r];
+    var eje = iEje > -1 ? String(row[iEje]==null?'':row[iEje]).trim().toLowerCase() : '';
+    var mgr = iMgr > -1 ? String(row[iMgr]==null?'':row[iMgr]).trim().toLowerCase() : '';
+    if (scopeEje !== null && eje !== scopeEje) continue;
+    if (scopeMgr !== null && mgr !== scopeMgr) continue;
+
+    var key2 = toDayKey_(iFec > -1 ? row[iFec] : '', tz);
+    if (!key2 || !keys[key2]) continue;   // fuera de la ventana de 7 días
+
+    keys[key2].visitas.push({
+      id:         iId  > -1 ? String(row[iId]==null?'':row[iId]).trim() : '',
+      merchant:   iMn  > -1 ? String(row[iMn]==null?'':row[iMn]).trim() : '',
+      merchantId: iMid > -1 ? String(row[iMid]==null?'':row[iMid]).trim() : '',
+      tipo:       iTipo> -1 ? String(row[iTipo]==null?'':row[iTipo]).trim() : '',
+      estado:     iEst > -1 ? String(row[iEst]==null?'':row[iEst]).trim() : '',
+      ejecutivo:  eje
+    });
+  }
+  return base;
+}
+
+function listTabs() {
+  Logger.log('Pestañas: ' + ss_().getSheets().map(function (s) { return s.getName(); }).join(' | '));
+}
+
+
+/* ================================================================
+ * ===============  MÓDULO RESUMEN (Dashboard)  ===================
+ * ================================================================ */
+
+var RESUMEN_CFG = {
+  SHEET_ID: '1HIu01Iz43z4ZF0x2ISEZj0_05K7UxLfLlUvR02Ql1PM',
+  TAB_TIENDAS: 'Tiendas',
+  TAB_META: 'Meta',
+  TZ: 'America/Lima',
+  CACHE_SEG: 300,
+  UMBRAL_FRESCURA_H: 30,
+  CUMP_OK: 1.00,          // cumplimiento (Ventas proy / Activas / FPD / VC): >=100% ok
+  CUMP_ALERTA: 0.90,      // 90–100% alerta; < rojo
+  VC_META: 0.60,          // meta estática de ratio de activación (Venta Conjunta)
+  MAX_CRITICAS: 20
+};
+
+var RESUMEN_KPIS = [
+  { clave: 'ventas',  etiqueta: 'Ventas',         disponible: true  },
+  { clave: 'activas', etiqueta: 'Activas',        disponible: true  },
+  { clave: 'fpd',     etiqueta: 'FPD15',          disponible: true  },
+  { clave: 'vc',      etiqueta: 'Venta Conjunta', disponible: true  }
+];
+
+/* ---------- Constructor de RESUMEN (sobre el mismo array ya leído) ----------
+ * FIX IMPORTANTE: el control de acceso se hace sobre el ROL REAL (callerRole,
+ * p. ej. 'usuario'). Antes getResumen convertía usuario->ejecutivo y recién ahí
+ * corría hasAccess_, pero esa lista NO incluye 'ejecutivo' -> TODO ejecutivo
+ * quedaba bloqueado del Resumen (kpis:null -> spinner infinito). La etiqueta
+ * 'ejecutivo' se conserva SOLO para la salida (badge y la condición del
+ * Seguimiento que ya tenías). Resultado: el Resumen se muestra a todos; el
+ * ejecutivo lo ve sin la tabla de Seguimiento. */
+function _buildResumen_(caller, callerRole, viewAsEmail, values, HM){
+  if (!hasAccess_(callerRole))
+    return { rol: (callerRole === 'usuario' ? 'ejecutivo' : callerRole), blocked: true,
+             kpis: null, seguimiento: [], criticas: [], meta: null, universo: 0 };
+
+  var rol = (callerRole === 'usuario') ? 'ejecutivo' : callerRole;  // etiqueta interna del Resumen
+  var email = caller;
+  var impersonando = false;
+
+  if (viewAsEmail && (rol === 'maestro' || rol === 'admin' || rol === 'supervisor')) {
+    var t = String(viewAsEmail).trim().toLowerCase();
+    var tr = roleOf_(t); if (tr === 'usuario') tr = 'ejecutivo';
+    if (!hasAccess_(roleOf_(t)))
+      return { rol: rol, blocked: false, kpis: null, seguimiento: [], criticas: [], meta: getMetaResumen_(), universo: 0 };
+    if (rol === 'supervisor') { rol = 'ejecutivo'; email = t; } else { rol = tr; email = t; }
+    impersonando = true;
+  }
+
+  var ix = HM;
+  var visibles = values;
+  if (rol === 'ejecutivo')       visibles = values.filter(function (r){ return _rsmLow_(r[ix.EJECUTIVO]) === email; });
+  else if (rol === 'supervisor') visibles = values.filter(function (r){ return _rsmLow_(r[ix.MANAGER]) === email; });
+
+  var calcData = readCalculados_();
+  var activaTree = null;
+  var ac = calcData.map[norm_('ACTIVA')];
+  if (ac && ac.tipo === 'formula' && ac.definicion && ac.definicion.formula){ try { activaTree = parseFormula_(ac.definicion.formula); } catch(e){ activaTree = null; } }
+
+  var esTotal = (!impersonando && (rol === 'maestro' || rol === 'admin'));
+  var kpis = _rsmKpisDe_(visibles, ix, activaTree, esTotal);
+
+  var seguimiento = [];
+  if (rol !== 'ejecutivo') {
+    var grupos = {};
+    visibles.forEach(function (r){ var e = String(r[ix.EJECUTIVO] || '').trim(); if (!e) return; (grupos[e] = grupos[e] || []).push(r); });
+    seguimiento = Object.keys(grupos).map(function (e){
+      var k = _rsmKpisDe_(grupos[e], ix, activaTree, false);   // nivel ejecutivo: cuota simple
+      return { ejecutivo: e, ventasProyPct: k.ventas.proyPct, activasPct: k.activas.pct, fpd: k.fpd.valor, fpdCumpl: k.fpd.cumpl, vc: k.vc.ratio };
+    }).sort(function (a, b){ return (a.ventasProyPct || 0) - (b.ventasProyPct || 0); });
+  }
+
+  return { rol: rol, email: email, blocked: false, kpisDef: RESUMEN_KPIS, kpis: kpis, seguimiento: seguimiento,
+           criticas: _rsmCriticas_(visibles, ix, rol, calcData), meta: getMetaResumen_(), universo: visibles.length };
+}
+
+/* ================= Agregación de KPIs ================= */
+function _rsmKpisDe_(filas, ix, activaTree, esTotal) {
+  var ventaTotal = 0, cuotaVentas = 0, proy = 0, activas = 0, cuotaActivas = 0;
+  filas.forEach(function (r) {
+    ventaTotal   += _rsmNum_(r[ix.VENTA_TOTAL])   || 0;
+    cuotaVentas  += _rsmNum_(r[ix.CUOTA_VENTAS])  || 0;
+    proy         += _rsmNum_(r[ix.PROY_CIERRE])   || 0;
+    cuotaActivas += _rsmNum_(r[ix.CUOTA_ACTIVAS]) || 0;
+    if (_rsmEsActiva_(r, ix, activaTree)) activas++;
+  });
+  var ventasProyPct = cuotaVentas > 0 ? proy / cuotaVentas : null;
+  var activasPct    = cuotaActivas > 0 ? activas / cuotaActivas : null;
+
+  var fpdReal  = _rsmFpdReal_(filas, ix);
+  var cuotaFpd = _rsmCuotaFpd_(filas, ix, esTotal);
+  var fpdCumpl = (fpdReal != null && fpdReal > 0 && cuotaFpd != null) ? cuotaFpd / fpdReal : null;
+
+  var vc = _rsmVc_(filas, ix);
+  var vcCumpl = (vc.ratio != null) ? vc.ratio / RESUMEN_CFG.VC_META : null;
+
+  return {
+    ventas:  { valor: Math.round(ventaTotal), cuota: Math.round(cuotaVentas), proy: Math.round(proy),
+               proyPct: ventasProyPct, estado: _rsmEstadoCump_(ventasProyPct), barra: _rsmCap01_(ventasProyPct), tick: 1.0 },
+    activas: { valor: activas, cuota: Math.round(cuotaActivas), pct: activasPct,
+               estado: _rsmEstadoCump_(activasPct), barra: _rsmCap01_(activasPct), tick: 1.0 },
+    fpd:     { valor: fpdReal, cuota: cuotaFpd, cumpl: fpdCumpl, estado: _rsmEstadoCump_(fpdCumpl),
+               barra: _rsmCap01_(fpdCumpl), tick: 1.0 },
+    vc:      { disponible: true, ratio: vc.ratio, num: vc.num, den: vc.den, meta: RESUMEN_CFG.VC_META, cumpl: vcCumpl,
+               estado: _rsmEstadoCump_(vcCumpl), barra: _rsmCap01_(vcCumpl), tick: 1.0 }
+  };
+}
+
+/* ================= Reglas aisladas ================= */
+// "Activa" por fórmula sembrada (fallback VENTA_TOTAL>0).
+function _rsmEsActiva_(r, ix, activaTree) {
+  if (!activaTree) return (_rsmNum_(r[ix.VENTA_TOTAL]) || 0) > 0;
+  var v = evalFormulaNode_(activaTree, function(name){ var i = idx_(ix, name); return i > -1 ? r[i] : ''; });
+  return v === 1;
+}
+
+// FPD15 real ponderado: sum(FFPD15_LAST4W)/sum(VFPD15_LAST4W).
+function _rsmFpdReal_(filas, ix) {
+  var F = 0, V = 0;
+  filas.forEach(function (r) { var f = _rsmNum_(r[ix.FFPD15_LAST4W]), v = _rsmNum_(r[ix.VFPD15_LAST4W]); if (f != null) F += f; if (v != null) V += v; });
+  return V > 0 ? F / V : null;
+}
+
+// Cuota FPD agregada: promedio simple de CUOTA_FPD (nivel manager/ejecutivo);
+// en la vista total del maestro usa CUOTA_FPD_GENERAL (no promedia promedios).
+function _rsmCuotaFpd_(filas, ix, esTotal) {
+  var col = esTotal ? ix.CUOTA_FPD_GENERAL : ix.CUOTA_FPD;
+  var s = 0, n = 0;
+  filas.forEach(function (r) { var c = _rsmNum_(r[col]); if (c != null) { s += c; n++; } });
+  return n > 0 ? s / n : null;
+}
+
+// Venta Conjunta: ratio de activación sum(activada)/sum(con_cupo).
+function _rsmVc_(filas, ix) {
+  var a = 0, c = 0;
+  filas.forEach(function (r) { var x = _rsmNum_(r[ix.ACTIVADA]), y = _rsmNum_(r[ix.CON_CUPO]); a += (x || 0); c += (y || 0); });
+  return { ratio: c > 0 ? a / c : null, num: Math.round(a), den: Math.round(c) };
+}
+
+/* ================= Tiendas críticas (usa el motor de semáforo encadenado) ================= */
+function _rsmCriticas_(filas, ix, rol, calcData) {
+  var cF7 = findSemCalcByOrigen_(calcData,'FPD7'), cF15 = findSemCalcByOrigen_(calcData,'FPD15'), cDif = findSemCalcByOrigen_(calcData,'DIF_REL');
+  var items = [];
+  filas.forEach(function (r) {
+    var dif = _rsmNum_(r[ix.DIF_REL]);
+    var vF7  = resolveOrigenNum_('FPD7',  r, ix, calcData);
+    var vF15 = resolveOrigenNum_('FPD15', r, ix, calcData);
+    var sF7  = cF7  ? _rsmMapSem_(semaforoRender_(vF7,  cF7.definicion,  cF7.tipo,  false).sem)  : 'nd';
+    var sF15 = cF15 ? _rsmMapSem_(semaforoRender_(vF15, cF15.definicion, cF15.tipo, false).sem) : 'nd';
+    var sDif = cDif ? _rsmMapSem_(semaforoRender_(dif, cDif.definicion, cDif.tipo, false).sem) : (dif == null ? 'nd' : (dif < 0 ? 'crit' : 'ok'));
+    var rojos = [sF7, sF15, sDif].filter(function (e){ return e === 'crit'; }).length;
+    var ambar = [sF7, sF15, sDif].filter(function (e){ return e === 'warn'; }).length;
+    if (rojos === 0 && ambar === 0) return;
+    items.push({ id: String(r[ix.MERCHANTID] || ''), nombre: String(r[ix.MERCHANTNAME] || ''),
+      ejecutivo: rol === 'ejecutivo' ? '' : String(r[ix.EJECUTIVO] || ''), zohoId: String(r[ix.ZOHO_ACCOUNT_ID] || ''),
+      dif: dif, difEstado: sDif, fpd7Estado: sF7, fpd15Estado: sF15, _score: rojos * 10 + ambar });
+  });
+  items.sort(function (a, b){ return b._score - a._score; });
+  return items.slice(0, RESUMEN_CFG.MAX_CRITICAS).map(function (o){ delete o._score; return o; });
+}
+
+/* ================= Frescura (hoja Meta, por etiqueta) ================= */
+function getMetaResumen_() {
+  var sh = SpreadsheetApp.openById(RESUMEN_CFG.SHEET_ID).getSheetByName(RESUMEN_CFG.TAB_META);
+  var raw = {};
+  if (sh && sh.getLastRow() >= 1) {
+    var vals = sh.getRange(1, 1, sh.getLastRow(), 2).getValues();   // sin shift: la fila 1 ya es dato
+    vals.forEach(function (r) { var k = String(r[0] || '').trim(); if (k) raw[k] = r[1]; });
+  }
+  var rep = _rsmFecha_(raw['reporte_actualizado']);
+  var ev  = _rsmFecha_(raw['ultima_evaluacion']);
+  var stale = false;
+  if (rep.date) stale = ((Date.now() - rep.date.getTime()) / 36e5) > RESUMEN_CFG.UMBRAL_FRESCURA_H;
+  return { reporteCorto: rep.corto, reporteLargo: rep.largo, evalCorto: ev.corto, evalLargo: ev.largo, stale: stale };
+}
+
+/* ================= Helpers (prefijo _rsm) =================
+ * _rsmLeerTab_ / _rsmIdx_ quedan definidos por compatibilidad aunque la carga
+ * unificada ya no los use (el Resumen ahora recibe el array de getBootstrap). */
+function _rsmLeerTab_(nombre) {
+  var sh = SpreadsheetApp.openById(RESUMEN_CFG.SHEET_ID).getSheetByName(nombre);
+  if (!sh) throw new Error('No existe la pestaña "' + nombre + '"');
+  var vals = sh.getDataRange().getValues();
+  var hdr = vals.shift().map(String);
+  return { hdr: hdr, filas: vals };
+}
+function _rsmIdx_(hdr) {
+  var m = {}; hdr.forEach(function (h, i) { m[String(h).trim().toUpperCase()] = i; });
+  return applyAliases_(m);
+}
+function _rsmNum_(v) {
+  if (v === '' || v === null || v === undefined) return null;
+  var n = Number(String(v).replace(/,/g, '').trim());
+  return isFinite(n) ? n : null;
+}
+function _rsmLow_(v) { return String(v || '').toLowerCase().trim(); }
+function _rsmCap01_(x) { return x == null ? 0 : Math.max(0, Math.min(1, x)); }
+function _rsmMapSem_(sem) { return sem === 'bad' ? 'crit' : sem === 'warn' ? 'warn' : sem === 'ok' ? 'ok' : 'nd'; }
+function _rsmEstadoCump_(pct) {
+  if (pct == null) return 'nd';
+  if (pct >= RESUMEN_CFG.CUMP_OK) return 'ok';
+  if (pct >= RESUMEN_CFG.CUMP_ALERTA) return 'warn';
+  return 'crit';
+}
+function _rsmFecha_(v) {
+  if (v === null || v === undefined || v === '') return { date: null, corto: '', largo: '' };
+  var dt = null;
+  if (v instanceof Date) {
+    dt = v;
+  } else {
+    // Puede venir como texto ISO (tras pasar por la caché JSON) o como fecha en texto.
+    var s = String(v).trim();
+    var parsed = new Date(s);
+    if (!isNaN(parsed.getTime())) dt = parsed;
+  }
+  if (dt) {
+    return { date: dt,
+      corto: Utilities.formatDate(dt, RESUMEN_CFG.TZ, 'dd/MM HH:mm'),
+      largo: Utilities.formatDate(dt, RESUMEN_CFG.TZ, 'dd/MM/yyyy HH:mm') };
+  }
+  var t = String(v || '').trim();
+  return { date: null, corto: t, largo: t };
+}
+
+/* ================= Sesión/rol (conectado a la auth) ================= */
+function resumenSesion_() {
+  var email = activeEmail_();
+  var rol = roleOf_(email);                  // maestro | admin | supervisor | usuario | baja | solicitar | sin_acceso
+  if (rol === 'usuario') rol = 'ejecutivo';  // el Resumen usa 'ejecutivo'
+  return { email: email, rol: rol };
+}
+  return {
+    getBootstrap: getBootstrap, getStores: getStores, getResumen: getResumen,
+    getStoreDetail: getStoreDetail, getVisitas: getVisitas, publicConfig: publicConfig,
+    getAdminData: getAdminData, setUserRole: setUserRole, getSupervisorUsers: getSupervisorUsers, removeUser: removeUser,
+    getCamposManager: getCamposManager, saveCampos: saveCampos, saveCalculado: saveCalculado, deleteCalculado: deleteCalculado,
+    listTabs: listTabs
+  };
+})(VC_CORE.shims.SpreadsheetApp, VC_CORE.shims.CacheService, VC_CORE.shims.Session,
+   VC_CORE.shims.Utilities, VC_CORE.shims.Logger, VC_CORE.shims.HtmlService);
+/*CORE-END*/
+
+/* =====================================================================
+ * CAPA DE DATOS DE CREATOR + google.script.run
+ * ===================================================================== */
+(function(){
+  'use strict';
+  var C = VC_CORE;
+  var FORMS = {
+    Tiendas:           { form: 'VC_Tiendas',           report: 'VC_Tiendas_Report' },
+    Visitas:           { form: 'VC_Visitas',           report: 'VC_Visitas_Report' },
+    Clerks:            { form: 'VC_Clerks',            report: 'VC_Clerks_Report' },
+    USUARIOS:          { form: 'VC_Usuarios',          report: 'VC_Usuarios_Report',          escribible: true },
+    CONFIG_CAMPOS:     { form: 'VC_Config_Campos',     report: 'VC_Config_Campos_Report',     escribible: true },
+    CONFIG_CALCULADOS: { form: 'VC_Config_Calculados', report: 'VC_Config_Calculados_Report', escribible: true }
+  };
+  var META_REPORT = 'VC_Meta_Report';
+  var INTERNOS = { SNAPSHOT: 1, BLOQUE: 1 };            // campos técnicos que la app no ve
+  var CAMPOS = {};                                        // nombreHoja -> [{display_name, link_name}]
+  var IDS = {};                                           // nombreHoja -> IDs de Creator (escribibles)
+  var CLERKS_VISTOS = {};
+  var DIAG = window.VC_DIAG = { inicio: Date.now(), tiempos: {}, conteos: {}, llamadas: 0, errores: [] };
+
+  function norm(s){ return String(s == null ? '' : s).trim().toUpperCase(); }
+  function sdk(){
+    if (!window.ZOHO || !ZOHO.CREATOR || !ZOHO.CREATOR.DATA) throw new Error('No cargó el SDK de Zoho Creator.');
+    return ZOHO.CREATOR;
+  }
+  function codigoDe(e){
+    try {
+      if (!e) return null;
+      if (e.code) return Number(e.code);
+      if (e.responseText){ var j = JSON.parse(e.responseText); return Number(j.code); }
+      if (typeof e === 'string'){ var j2 = JSON.parse(e); return Number(j2.code); }
+    } catch(_){}
+    return null;
+  }
+  function errorLegible(e, donde){
+    var msg = '';
+    try {
+      if (e instanceof Error) msg = e.message;
+      else if (e && e.message) msg = e.message;
+      else if (e && e.responseText) msg = (JSON.parse(e.responseText).message || e.responseText);
+      else msg = (typeof e === 'string') ? e : JSON.stringify(e);
+    } catch(_){ msg = String(e); }
+    var err = new Error('Creator (' + donde + '): ' + msg);
+    DIAG.errores.push(err.message);
+    return err;
+  }
+
+  async function leer(report, criteria, extra){
+    DIAG.llamadas++;
+    var cfg = { report_name: report, criteria: criteria || 'ID != 0', field_config: 'all', max_records: 1000 };
+    if (extra) Object.keys(extra).forEach(function(k){ cfg[k] = extra[k]; });
+    try {
+      var r = await sdk().DATA.getRecords(cfg);
+      var cod = codigoDe(r);
+      if (cod === 9220) return { data: [], resp: r };
+      if (cod && cod !== 3000) throw r;
+      return { data: (r && r.data) || [], resp: r };
+    } catch(e){
+      if (codigoDe(e) === 9220) return { data: [], resp: e };
+      throw errorLegible(e, 'leyendo ' + report);
+    }
+  }
+  /* Lee todo lo que cumpla el criterio, paginando con record_cursor si hace falta. */
+  async function leerTodo(report, criteria){
+    var out = [], cursor = null;
+    for (var vuelta = 0; vuelta < 60; vuelta++){
+      var res = await leer(report, criteria, cursor ? { record_cursor: cursor } : null);
+      out = out.concat(res.data);
+      cursor = res.resp && (res.resp.record_cursor || (res.resp.info && res.resp.info.record_cursor));
+      if (!cursor || res.data.length < 1000) break;
+    }
+    return out;
+  }
+  /* Tiendas: en bloques de 1.000 (campo BLOQUE), varios a la vez. */
+  async function leerTiendas(snap, nBloques){
+    var rep = FORMS.Tiendas.report;
+    function crit(b){ return '(SNAPSHOT == "' + snap + '" && BLOQUE == "' + b + '")'; }
+    try {
+      if (nBloques > 0){
+        var partes = new Array(nBloques), sig = 0;
+        async function trabajador(){
+          while (sig < nBloques){ var b = sig++; partes[b] = (await leer(rep, crit(b))).data; }
+        }
+        await Promise.all([trabajador(), trabajador(), trabajador(), trabajador()]);
+        return [].concat.apply([], partes);
+      }
+      var out = [];
+      for (var b = 0; b < 200; b++){
+        var p = (await leer(rep, crit(b))).data;
+        if (!p.length) break;
+        out = out.concat(p);
+      }
+      if (out.length) return out;
+    } catch(e){
+      console.warn('[VC] lectura por bloques falló, pruebo con cursor:', e && e.message);
+    }
+    return leerTodo(rep, '(SNAPSHOT == "' + snap + '")');
+  }
+  async function camposDe(form){
+    DIAG.llamadas++;
+    try {
+      var r = await sdk().META.getFields({ form_name: form });
+      return ((r && r.fields) || []).filter(function(f){ return !INTERNOS[norm(f.link_name)]; });
+    } catch(e){ throw errorLegible(e, 'leyendo campos de ' + form); }
+  }
+  function armarHoja(nombre, registros){
+    var flds = CAMPOS[nombre];
+    var filas = [flds.map(function(f){ return f.display_name; })];
+    registros.forEach(function(rec){ filas.push(flds.map(function(f){ return C.tipar(rec[f.link_name]); })); });
+    C.LIBRO.hojas[nombre] = new C.Hoja(nombre, filas);
+    if (FORMS[nombre].escribible) IDS[nombre] = registros.map(function(r){ return r.ID; });
+    DIAG.conteos[nombre] = registros.length;
+  }
+
+  /* ---------- Tiendas: carga diferida + caché del día en el navegador ---------- */
+  var MODULO = window.VC_MODULO || '';
+  var BLOQUES = 0, TIENDAS_PROMESA = null;
+  function idb(){
+    return new Promise(function(ok){
+      var listo = false;
+      function fin(v){ if (!listo){ listo = true; ok(v); } }
+      setTimeout(function(){ fin(null); }, 1500);
+      try {
+        var r = indexedDB.open('vc_visor', 1);
+        r.onupgradeneeded = function(){ r.result.createObjectStore('cache'); };
+        r.onsuccess = function(){ fin(r.result); };
+        r.onerror = r.onblocked = function(){ fin(null); };
+      } catch(e){ fin(null); }
+    });
+  }
+  async function cacheLeer(snap){
+    var db = await idb(); if (!db) return null;
+    return new Promise(function(ok){
+      try {
+        var q = db.transaction('cache', 'readonly').objectStore('cache').get('tiendas');
+        q.onsuccess = function(){ var v = q.result; ok(v && v.snap === snap ? v.recs : null); };
+        q.onerror = function(){ ok(null); };
+      } catch(e){ ok(null); }
+    });
+  }
+  async function cacheGuardar(snap, recs){
+    var db = await idb(); if (!db) return;
+    try { db.transaction('cache', 'readwrite').objectStore('cache').put({ snap: snap, recs: recs, guardado: Date.now() }, 'tiendas'); } catch(e){}
+  }
+  function asegurarTiendas(){
+    if (TIENDAS_PROMESA) return TIENDAS_PROMESA;
+    TIENDAS_PROMESA = (async function(){
+      var t = Date.now(), snap = DIAG.snapshot;
+      var recs = await cacheLeer(snap);
+      DIAG.tiendasDesde = recs ? 'cache del navegador' : 'Creator';
+      if (!recs){ recs = await leerTiendas(snap, BLOQUES); cacheGuardar(snap, recs); }
+      armarHoja('Tiendas', recs);
+      C.limpiarCache();                                     // el bootstrap vacío no debe quedar en caché
+      DIAG.tiempos.tiendas = Date.now() - t;
+    })();
+    TIENDAS_PROMESA.catch(function(){ TIENDAS_PROMESA = null; });
+    return TIENDAS_PROMESA;
+  }
+  var NECESITAN_TIENDAS = { getStores: 1, getResumen: 1, getStoreDetail: 1, getSupervisorUsers: 1 };
+
+  /* ---------- precarga de la sesión ---------- */
+  async function esperarSdk(){
+    for (var i = 0; i < 100 && !(window.ZOHO && ZOHO.CREATOR); i++) await new Promise(function(r){ setTimeout(r, 100); });
+    if (!(window.ZOHO && ZOHO.CREATOR)){
+      var intentos = (window.VC_SDK && VC_SDK.intentos.length) ? VC_SDK.intentos.join(' | ') : 'sin respuesta';
+      throw new Error('No cargó el SDK de Zoho Creator. Esta página solo funciona abierta dentro de Creator ' +
+                      '(en la página del widget, en modo acceso). Detalle: ' + intentos);
+    }
+    try { if (typeof ZOHO.CREATOR.init === 'function') await ZOHO.CREATOR.init(); } catch(_){}
+    if (!ZOHO.CREATOR.DATA)
+      throw new Error('El SDK de Creator cargó incompleto (partes: ' + Object.keys(ZOHO.CREATOR).join(', ') + ').');
+    return ZOHO.CREATOR;
+  }
+  var LISTO = (async function(){
+    var t0 = Date.now(), Z = await esperarSdk();
+    var ip = await Z.UTIL.getInitParams();
+    C.SESION.email = String((ip && ip.loginUser) || '').trim().toLowerCase();
+    DIAG.usuario = C.SESION.email;
+
+    var nombres = Object.keys(FORMS);
+    var metas = await Promise.all(nombres.map(function(n){ return camposDe(FORMS[n].form); }));
+    nombres.forEach(function(n, i){ CAMPOS[n] = metas[i]; });
+
+    var meta = (await leer(META_REPORT, 'ID != 0')).data, kv = {};
+    meta.forEach(function(r){ kv[String(r.CLAVE || '').trim()] = (r.VALOR == null ? '' : String(r.VALOR)); });
+    var snap = kv.snapshot_activo || '';
+    if (!snap) throw new Error('VC_Meta no tiene snapshot_activo: corre primero la carga de Hex.');
+    DIAG.snapshot = snap;
+    // Las fechas de Meta están en hora de Lima: se convierten a fecha real para que se vean
+    // bien aunque el celular tenga otra zona horaria (Perú es UTC-5 todo el año).
+    function fechaLima(s){
+      var m = String(s).match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2}))?$/);
+      return m ? new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] + 5, +m[5], +(m[6] || 0))) : s;
+    }
+    C.LIBRO.hojas.Meta = new C.Hoja('Meta', meta.map(function(r){
+      var v = r.VALOR == null ? '' : String(r.VALOR);
+      return [String(r.CLAVE || ''), fechaLima(v)];
+    }));
+    DIAG.tiempos.meta = Date.now() - t0;
+
+    var critSnap = '(SNAPSHOT == "' + snap + '")', t1 = Date.now();
+    BLOQUES = Number(kv.tiendas_bloques) || 0;
+    var res = await Promise.all([
+      leerTodo(FORMS.USUARIOS.report, 'ID != 0'),
+      leerTodo(FORMS.CONFIG_CAMPOS.report, 'ID != 0'),
+      leerTodo(FORMS.CONFIG_CALCULADOS.report, 'ID != 0'),
+      leerTodo(FORMS.Visitas.report, critSnap),
+      (MODULO === 'visitas') ? Promise.resolve(null) : asegurarTiendas()
+    ]);
+    armarHoja('USUARIOS', res[0]);
+    armarHoja('CONFIG_CAMPOS', res[1]);
+    armarHoja('CONFIG_CALCULADOS', res[2]);
+    armarHoja('Visitas', res[3]);
+    if (!C.LIBRO.hojas.Tiendas) armarHoja('Tiendas', []);  // solo encabezados (Visitas no necesita filas)
+    armarHoja('Clerks', []);                               // se llena por tienda al abrir el detalle
+    DIAG.tiempos.datos = Date.now() - t1;
+    DIAG.tiempos.total = Date.now() - DIAG.inicio;
+    console.log('[VC] listo', JSON.stringify(DIAG));
+  })();
+
+  async function asegurarClerks(rowNumber){
+    var t = C.LIBRO.hojas.Tiendas; if (!t) return;
+    var fila = t.filas[parseInt(rowNumber, 10) - 1]; if (!fila) return;
+    var iMid = t.filas[0].map(norm).indexOf('MERCHANTID');
+    var mid = iMid > -1 ? String(fila[iMid] == null ? '' : fila[iMid]).trim().replace(/\.0+$/, '') : '';
+    if (!mid || CLERKS_VISTOS[mid]) return;
+    var recs = (await leer(FORMS.Clerks.report, '(SNAPSHOT == "' + DIAG.snapshot + '" && MERCHANT_ID == "' + mid + '")')).data;
+    CLERKS_VISTOS[mid] = true;
+    var hc = C.LIBRO.hojas.Clerks, flds = CAMPOS.Clerks;
+    recs.forEach(function(rec){ hc.filas.push(flds.map(function(f){ return C.tipar(rec[f.link_name]); })); });
+  }
+
+  /* ---------- guardar en Creator las hojas que el servidor modificó ---------- */
+  function copiaEscribibles(){
+    var c = {};
+    Object.keys(FORMS).forEach(function(n){
+      var h = C.LIBRO.hojas[n];
+      if (FORMS[n].escribible && h) c[n] = h.filas.map(function(f){ return f.slice(); });
+    });
+    return c;
+  }
+  async function persistir(nombre){
+    var h = C.LIBRO.hojas[nombre], def = FORMS[nombre], flds = CAMPOS[nombre];
+    var porNombre = {};
+    flds.forEach(function(f){ porNombre[norm(f.display_name)] = f.link_name; });
+    var head = (h.filas[0] || []).map(function(x){ return String(x == null ? '' : x).trim(); });
+    var regs = h.filas.slice(1).filter(function(f){ return !C.filaVacia(f); }).map(function(f){
+      var o = {};
+      head.forEach(function(hn, i){ var ln = porNombre[norm(hn)]; if (ln) o[ln] = C.aTexto(f[i]); });
+      return o;
+    });
+    // 1) alta de la versión nueva
+    var nuevos = [];
+    for (var i = 0; i < regs.length; i += 200){
+      var lote = regs.slice(i, i + 200);
+      DIAG.llamadas++;
+      var r;
+      try { r = await sdk().DATA.addRecords({ form_name: def.form, payload: { data: lote } }); }
+      catch(e){ throw errorLegible(e, 'guardando ' + def.form); }
+      var lista = (r && r.result) ? r.result : [r];
+      lista.forEach(function(x){
+        if (!x || Number(x.code) !== 3000) throw errorLegible(x, 'guardando ' + def.form);
+        if (x.data && x.data.ID) nuevos.push(x.data.ID);
+      });
+    }
+    // 2) baja de la versión anterior (solo si el alta salió completa)
+    var viejos = IDS[nombre] || [];
+    for (var j = 0; j < viejos.length; j += 50){
+      var crit = viejos.slice(j, j + 50).map(function(id){ return 'ID == ' + id; }).join(' || ');
+      DIAG.llamadas++;
+      try { await sdk().DATA.deleteRecords({ report_name: def.report, criteria: crit }); }
+      catch(e){ if (codigoDe(e) !== 9220) throw errorLegible(e, 'limpiando ' + def.form); }
+    }
+    IDS[nombre] = nuevos;
+    h.sucia = false;
+  }
+
+  /* ---------- google.script.run ---------- */
+  var COLA = Promise.resolve();
+  function invocar(nombre, args, ok, fallo, usuario){
+    COLA = COLA.then(async function(){
+      var copia = null;
+      try {
+        await LISTO;
+        var fn = VC_SERVER[nombre];
+        if (typeof fn !== 'function') throw new Error('Función no disponible en el widget: ' + nombre);
+        if (NECESITAN_TIENDAS[nombre] || (nombre === 'getBootstrap' && MODULO !== 'visitas')) await asegurarTiendas();
+        if (nombre === 'getStoreDetail') await asegurarClerks(args[0]);
+        copia = copiaEscribibles();
+        var res = fn.apply(null, args);
+        var sucias = Object.keys(FORMS).filter(function(n){ return FORMS[n].escribible && C.LIBRO.hojas[n] && C.LIBRO.hojas[n].sucia; });
+        for (var i = 0; i < sucias.length; i++) await persistir(sucias[i]);
+        var out = (res === undefined) ? null : JSON.parse(JSON.stringify(res));
+        setTimeout(function(){ if (ok) ok(out, usuario); }, 0);
+      } catch(e){
+        if (copia){                                   // deja la memoria igual a lo que quedó guardado
+          Object.keys(copia).forEach(function(n){ var h = C.LIBRO.hojas[n]; if (h){ h.filas = copia[n]; h.sucia = false; } });
+          C.limpiarCache();
+        }
+        var err = (e instanceof Error) ? e : errorLegible(e, nombre);
+        console.error('[VC] ' + nombre + ':', err);
+        setTimeout(function(){ if (fallo) fallo(err, usuario); }, 0);
+      }
+    });
+  }
+  function runner(ok, fallo, usuario){
+    return new Proxy({}, {
+      get: function(_, prop){
+        if (prop === 'withSuccessHandler') return function(fn){ return runner(fn, fallo, usuario); };
+        if (prop === 'withFailureHandler') return function(fn){ return runner(ok, fn, usuario); };
+        if (prop === 'withUserObject') return function(o){ return runner(ok, fallo, o); };
+        if (typeof prop !== 'string') return undefined;
+        return function(){ invocar(prop, Array.prototype.slice.call(arguments), ok, fallo, usuario); };
+      }
+    });
+  }
+  window.google = window.google || {};
+  window.google.script = window.google.script || {};
+  Object.defineProperty(window.google.script, 'run', { get: function(){ return runner(null, null, undefined); } });
+  window.google.script.host = { close: function(){}, editor: null };
+})();
+
+</script>
+</head>
+<body>
+<style>
+  :root{
+    --green:#2e9e3f; --green-d:#1f7c2e;
+    --ink:#1a1f1a; --muted:#6b756b; --line:#e6e9e6; --bg:#f6f8f6; --card:#fff;
+  }
+  #bootGate{position:fixed;inset:0;background:var(--bg);z-index:999;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
+  #bootGate img{width:200px;max-width:55%;animation:pulse 1.3s ease-in-out infinite}
+  #bootGate span{color:var(--muted);font-size:13px}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:var(--ink);background:var(--bg)}
+  header.topbar{background:var(--green);color:#fff;padding:12px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  .topbar h1{font-size:17px;font-weight:600;margin:0;letter-spacing:.2px}
+  .hactions{display:flex;align-items:center;gap:8px}
+  .badge{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.6px;background:#fff;color:var(--green-d);padding:3px 9px;border-radius:20px}
+  .chipwrap{position:relative}
+  .user{font-size:12px;background:rgba(255,255,255,.18);padding:6px 12px;border-radius:20px;white-space:nowrap;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+  .user:hover{background:rgba(255,255,255,.28)}
+  .user .caret{font-size:9px;opacity:.85}
+  .menu{position:absolute;right:0;top:calc(100% + 6px);background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 34px rgba(0,0,0,.18);min-width:190px;display:none;overflow:hidden;z-index:30}
+  .menu.open{display:block}
+  .menu .mtitle{padding:9px 16px;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);border-bottom:1px solid var(--line)}
+  .menu button{display:block;width:100%;text-align:left;background:none;border:none;padding:11px 16px;font-size:14px;color:var(--ink);cursor:pointer}
+  .menu button:hover{background:#f0f3f0}
+  .menu .mempty{padding:12px 16px;font-size:13px;color:var(--muted)}
+  .btn{background:var(--green-d);color:#fff;border:none;padding:8px 14px;border-radius:9px;font-size:13px;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)}
+  .btn.sm{padding:6px 11px;font-size:12px}
+  .btn.grey{background:#e6e9e6;color:var(--ink)}
+  .viewbanner{background:#fff5d6;border-bottom:1px solid #ecdca0;color:#7a5c00;padding:9px 20px;font-size:13px;display:flex;justify-content:space-between;align-items:center;gap:12px}
+  .wrap{max-width:1100px;margin:0 auto;padding:18px 20px 60px}
+  .toolbar{margin:0 0 16px}
+  .search{width:100%;max-width:360px;padding:10px 14px;border:1px solid var(--line);border-radius:10px;font-size:14px;outline:none;background:#fff}
+  .search:focus{border-color:var(--green)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;cursor:pointer;transition:box-shadow .15s,transform .15s}
+  .card:hover{box-shadow:0 6px 20px rgba(0,0,0,.08);transform:translateY(-2px);border-color:#d3ddd3}
+  .card h3{margin:0 0 10px;font-size:15px;font-weight:600;line-height:1.3}
+  .card .field{font-size:13px;color:var(--muted);margin:3px 0}
+  .card .field b{color:var(--ink);font-weight:600}
+  .empty{padding:40px;text-align:center;color:var(--muted)}
+  #sentinel{height:24px}
+  /* logo mientras carga */
+  .loading-logo{grid-column:1 / -1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;min-height:65vh;padding:20px}
+  .loading-logo img{width:200px;max-width:55%;animation:pulse 1.3s ease-in-out infinite}
+  .loading-logo span{color:var(--muted);font-size:13px}
+  @keyframes pulse{0%,100%{opacity:.4;transform:scale(.98)}50%{opacity:1;transform:scale(1)}}
+  /* panel de detalle */
+  .overlay{position:fixed;inset:0;background:rgba(0,0,0,.35);opacity:0;pointer-events:none;transition:opacity .2s;z-index:10}
+  .overlay.open{opacity:1;pointer-events:auto}
+  .panel{position:fixed;top:0;right:0;height:100%;width:380px;max-width:90vw;background:#fff;box-shadow:-8px 0 30px rgba(0,0,0,.15);transform:translateX(100%);transition:transform .25s;z-index:11;display:flex;flex-direction:column}
+  .panel.open{transform:translateX(0)}
+  .panel .ph{background:var(--green);color:#fff;padding:16px 18px;display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+  .panel .ph h2{margin:0;font-size:16px;font-weight:600}
+  .panel .close{background:none;border:none;color:#fff;font-size:24px;cursor:pointer;line-height:1}
+  .panel .pb{padding:8px 18px 24px;overflow-y:auto;overscroll-behavior:contain}
+  .detail{padding:12px 0;border-bottom:1px solid var(--line)}
+  .detail .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .detail .v{font-size:15px;margin-top:2px;word-break:break-word}
+  /* sección de vendedores en el detalle */
+  .clerk-row{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--line)}
+  .clerk-name{flex:1;min-width:0;font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .clerk-metrics{text-align:right;flex-shrink:0}
+  .clerk-und{font-size:14px;font-weight:600}
+  .clerk-und .clerk-u{font-size:12px;font-weight:400;color:var(--muted)}
+  .clerk-mora{display:flex;align-items:center;justify-content:flex-end;gap:2px;font-size:12px;color:var(--muted);margin-top:2px}
+  .clerk-head{padding:16px 0 6px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+  .clerk-empty{font-size:13px;color:var(--muted);padding:6px 0 12px}
+  .clerk-row.inactivo{opacity:.55}
+  .clerk-row.inactivo .clerk-name{color:var(--muted);font-weight:500}
+  .clerk-tag{font-size:10px;color:var(--muted);font-weight:400;margin-left:6px}
+  .clerk-sub{font-size:11px;color:var(--muted);font-weight:400;margin-top:1px}
+  /* desplegable de acciones (panel de detalle) */
+  .actions{position:relative;margin:12px 0 6px}
+  .act-btn{width:100%;display:flex;align-items:center;justify-content:center;gap:8px;background:var(--green-d)}
+  .act-menu{display:none;position:absolute;left:0;right:0;top:calc(100% + 6px);background:#fff;border:1px solid var(--line);border-radius:10px;box-shadow:0 12px 34px rgba(0,0,0,.18);overflow:hidden;z-index:5}
+  .act-menu.open{display:block}
+  .act-item{display:block;padding:11px 16px;font-size:14px;color:var(--ink);text-decoration:none;cursor:pointer}
+  .act-item:hover{background:#f0f3f0}
+  .act-item.disabled{color:var(--muted);cursor:default}
+  .act-item.disabled:hover{background:none}
+  /* vista de usuarios */
+  .uhead{display:flex;align-items:center;gap:14px;margin-bottom:16px}
+  .uhead h2{margin:0;font-size:20px}
+  .utoolbar{display:flex;align-items:center;justify-content:space-between;margin:6px 0 8px}
+  .ulabel{font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted)}
+  .tablewrap{border:1px solid var(--line);border-radius:12px;overflow:auto;background:#fff;max-height:60vh}
+  table.utable{width:100%;border-collapse:collapse}
+  .utable th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);background:#f0f3f0;padding:11px 14px;position:sticky;top:0;z-index:2;box-shadow:0 1px 0 var(--line)}
+  .utable td{padding:10px 14px;border-top:1px solid var(--line);font-size:13px;vertical-align:middle}
+  .utable td.em{word-break:break-all}
+  .utable td.ic{width:1%;white-space:nowrap;text-align:center}
+  .utable select{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:#fff}
+  .rolefix{font-size:13px;color:var(--muted)}
+  tr.deleted{opacity:.5}
+  tr.deleted td{color:#9aa39a;filter:grayscale(1)}
+  .iconbtn{background:none;border:none;cursor:pointer;padding:6px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:var(--muted)}
+  .iconbtn:hover{background:#f0f3f0}
+  .iconbtn.eye{color:var(--green-d)}
+  .iconbtn.del{color:#c0392b}
+  .iconbtn.add{background:var(--green-d);color:#fff;width:34px;height:34px;font-size:22px;line-height:0;border-radius:50%}
+  .iconbtn.add:hover{background:var(--green-d);filter:brightness(1.1)}
+  /* modal agregar usuario */
+  .modal-ov{position:fixed;inset:0;background:rgba(0,0,0,.45);display:none;align-items:flex-start;justify-content:center;z-index:40;padding:70px 16px}
+  .modal-ov.open{display:flex}
+  .modal{background:#fff;border-radius:14px;width:420px;max-width:100%;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+  .modal-h{background:var(--green);color:#fff;padding:14px 18px;border-radius:14px 14px 0 0;display:flex;justify-content:space-between;align-items:center}
+  .modal-h h2{margin:0;font-size:16px}
+  .close2{background:none;border:none;color:#fff;font-size:24px;cursor:pointer}
+  .modal-b{padding:16px 18px 20px}
+  .mfield{margin-bottom:14px}
+  .mfield label{display:block;font-size:12px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);margin-bottom:6px}
+  .mfield input,.mfield select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font-size:14px;background:#fff}
+  .mactions{display:flex;justify-content:flex-end;gap:8px;margin-top:6px}
+  body.no-scroll{overflow:hidden}
+  .card .c-title{font-weight:600;font-size:14px;line-height:1.25;max-width:80%}
+  .card .c-pills{display:flex;gap:5px;margin:8px 0 4px;flex-wrap:wrap}
+  .pill{font-size:10px;padding:2px 8px;border-radius:20px;white-space:nowrap}
+  .pill-ok{background:#e7f5ec;color:#1f7c2e}
+  .pill-bad{background:#fbe9e9;color:#c0392b}
+  .pill-neu{background:#f0f3f0;color:#6b756b}
+  .card .c-sub{font-size:12px;color:var(--muted);margin-bottom:10px}
+  .c-sem{display:flex;gap:16px;flex-wrap:wrap;border-top:0.5px solid var(--line);padding-top:10px;margin-bottom:10px}
+  .c-sem .sem-l{font-size:10px;color:var(--muted)}
+  .c-sem .sem-v{font-size:13px;font-weight:500}
+  .c-foot{font-size:12px;color:var(--muted);line-height:1.7}
+  .c-foot .mut{color:#a7aea7}
+  .badge-visita{position:absolute;top:10px;right:12px;font-size:10px;padding:2px 7px;border-radius:20px;background:#fdf3d6;color:#7a5c00;z-index:1}
+  /* gestor de campos */
+  .chint{font-size:12px;color:var(--muted);margin:2px 0 12px}
+  .ctable{width:100%;border-collapse:collapse;min-width:720px}
+  .ctable th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.6px;color:var(--muted);background:#f0f3f0;padding:9px 12px;position:sticky;top:0;z-index:2;box-shadow:0 1px 0 var(--line);white-space:nowrap}
+  .ctable td{padding:8px 12px;border-top:1px solid var(--line);font-size:13px;vertical-align:middle}
+  .ctable tr.fhuerfana td{background:#fbf7ef}
+  .ctable .c-h{width:34px;text-align:center;padding:8px}
+  .ctable .c-c{width:1%;white-space:nowrap;text-align:center}
+  .ctable input[type=checkbox]{width:16px;height:16px;cursor:pointer}
+  .fdrag{cursor:grab;color:var(--muted);font-size:16px;user-select:none;touch-action:none}
+  .fdrag:active{cursor:grabbing}
+  .fdrag-ghost td{opacity:.4;background:#eef3ee}
+  .fcol{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;word-break:break-all;white-space:nowrap}
+  .fcol .fbadge{margin-left:6px}
+  .fet{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;width:100%;min-width:160px}
+  .ffmt{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:12px;background:#fff}
+  .fbadge{font-size:9px;padding:1px 6px;border-radius:20px;text-transform:uppercase;letter-spacing:.4px}
+  .fnew{background:#e7f5ec;color:#1f7c2e}
+  .forph{background:#fdeaea;color:#c0392b}
+  .fcalc{background:#eef0fb;color:#3b46b3;font-weight:700;text-transform:none;letter-spacing:0}
+  .falert{font-size:10px;color:#c0392b;margin-top:3px;white-space:normal;text-transform:none;letter-spacing:0}
+  .fmuted{font-size:12px;color:var(--muted)}
+  .ctable .c-n{width:44px;text-align:center}
+  .fpos{width:40px;padding:4px;border:1px solid var(--line);border-radius:6px;font-size:12px;text-align:center}
+  .fdrag.off{opacity:.3;cursor:default}
+  .iconbtn:disabled{opacity:.35;cursor:default}
+  .mrow2{display:flex;gap:10px}
+  .mrow2 .mfield{flex:1}
+  .calcprev{display:flex;gap:8px;flex-wrap:wrap;align-items:center;min-height:24px}
+  .chip{display:inline-flex;align-items:center;font-size:12px;background:#f0f3f0;padding:3px 9px;border-radius:20px}
+  .ccrow{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+  .ccrow select{flex:1;padding:7px 9px;border:1px solid var(--line);border-radius:8px;font-size:13px;background:#fff}
+  /* barra lateral de módulos */
+  .htitle{display:flex;align-items:center;gap:10px}
+  .hamb{background:none;border:none;color:#fff;font-size:22px;cursor:pointer;line-height:1;padding:2px 6px;border-radius:8px}
+  .hamb:hover{background:rgba(255,255,255,.18)}
+  .navpanel{position:fixed;top:0;left:0;height:100%;width:260px;max-width:80vw;background:#fff;box-shadow:8px 0 30px rgba(0,0,0,.15);transform:translateX(-100%);transition:transform .25s;z-index:12;display:flex;flex-direction:column}
+  .navpanel.open{transform:translateX(0)}
+  .navhead{background:var(--green);color:#fff;padding:16px 18px;font-size:16px;font-weight:600;display:flex;justify-content:space-between;align-items:center}
+  .navhead .close{background:none;border:none;color:#fff;font-size:24px;cursor:pointer;line-height:1}
+  .navitem{display:block;width:100%;text-align:left;background:none;border:none;padding:14px 18px;font-size:15px;color:var(--ink);cursor:pointer;border-bottom:1px solid var(--line)}
+  .navitem:hover{background:#f0f3f0}
+  .navitem.active{background:#e7f5ec;color:var(--green-d);font-weight:600;border-left:3px solid var(--green)}
+  .navitem:disabled{color:var(--muted);cursor:default}
+  .navitem:disabled:hover{background:none}
+  .navitem small{color:var(--muted);font-weight:400;font-size:11px}
+  /* agenda de visitas */
+  .week{display:grid;grid-template-columns:repeat(7,1fr);gap:10px}
+  .day{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .day.today{border-color:var(--green);box-shadow:0 0 0 1px var(--green)}
+  .dayhead{background:#f0f3f0;padding:8px 10px;font-size:12px;font-weight:600;color:var(--ink);display:flex;align-items:center;gap:6px}
+  .day.today .dayhead{background:var(--green);color:#fff}
+  .daycount{margin-left:auto;background:rgba(0,0,0,.12);border-radius:20px;padding:0 7px;font-size:11px}
+  .day.today .daycount{background:rgba(255,255,255,.28)}
+  .daybody{padding:8px;display:flex;flex-direction:column;gap:8px;min-height:40px}
+  .vempty{font-size:12px;color:var(--muted);text-align:center;padding:10px 0}
+  .vcard{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;cursor:pointer;transition:box-shadow .15s,transform .15s}
+  .vcard:hover{box-shadow:0 4px 14px rgba(0,0,0,.08);transform:translateY(-1px);border-color:#d3ddd3}
+  .vcard-off{cursor:default;opacity:.6}
+  .vcard-off:hover{box-shadow:none;transform:none;border-color:var(--line)}
+  .vname{font-size:13px;font-weight:600;line-height:1.25}
+  .vmeta{font-size:11px;color:var(--muted);margin-top:2px}
+  .vpills{margin-top:6px}
+  .veje{font-size:11px;color:var(--muted);margin-top:6px;word-break:break-all}
+  @media (max-width:820px){ .week{grid-template-columns:1fr} }
+  /* barra de filtros */
+  .toolrow{display:flex;gap:8px;align-items:center}
+  .toolrow .search{flex:1}
+  .filterpanel{margin-top:10px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px}
+  .fchips{display:flex;flex-wrap:wrap;gap:8px}
+  .fchip{font-size:12px;padding:6px 12px;border-radius:20px;border:1px solid var(--line);background:#fff;color:var(--ink);cursor:pointer}
+  .fchip:hover{background:#f0f3f0}
+  .fchip.on{background:#e7f5ec;border-color:var(--green);color:var(--green-d);font-weight:600}
+  .fsels{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px}
+  .fsel{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+  .fsel select{padding:6px 8px;border:1px solid var(--line);border-radius:7px;font-size:13px;background:#fff;color:var(--ink)}
+  .fclear{margin-top:10px}
+  .linkbtn{background:none;border:none;color:var(--green-d);font-size:12px;cursor:pointer;padding:0;text-decoration:underline}
+</style>
+
+<div id="bootGate"><img src="" id="bootLogo" alt="PayJoy"><span>Cargando&hellip;</span></div>
+<header class="topbar">
+  <div class="htitle">
+    <button class="hamb" onclick="openNav(event)" aria-label="M&eacute;nu">&#9776;</button>
+    <h1>Visor de Tiendas</h1>
+  </div>
+  <div class="hactions">
+    <span class="badge" id="roleBadge"></span>
+    <div class="chipwrap">
+      <span class="user" id="userChip" onclick="toggleMenu(event)">&hellip; <span class="caret">&#9660;</span></span>
+      <div class="menu" id="userMenu"></div>
+    </div>
+  </div>
+</header>
+
+<div class="overlay" id="navOverlay" onclick="closeNav()"></div>
+<aside class="navpanel" id="navPanel">
+  <div class="navhead"><span>M&oacute;dulos</span><button class="close" onclick="closeNav()">&times;</button></div>
+  <button class="navitem" id="navResumen" onclick="navGo('resumen')">Resumen</button>
+  <button class="navitem active" id="navTiendas" onclick="navGo('tiendas')">Tiendas</button>
+  <button class="navitem" id="navVisitas" onclick="navGo('visitas')">Visitas</button>
+</aside>
+
+<div class="viewbanner" id="viewBanner" style="display:none">
+  <span id="viewBannerText"></span>
+  <button class="btn sm" onclick="loadData()">Salir de esta vista</button>
+</div>
+
+<div class="wrap">
+  <div id="storeView">
+    <div class="toolbar">
+      <div class="toolrow">
+        <input class="search" id="search" placeholder="Buscar tienda&hellip;" oninput="applySearch()">
+        <button class="btn sm grey" id="filterBtn" onclick="toggleFilters()">Filtros</button>
+      </div>
+      <div class="filterpanel" id="filterPanel" style="display:none"></div>
+    </div>
+    <div class="grid" id="grid"></div>
+    <div id="sentinel"></div>
+  </div>
+  <div id="usersView" style="display:none"></div>
+  <div id="camposView" style="display:none"></div>
+  <div id="visitasView" style="display:none"></div>
+  <div id="rsmView" class="rsm-view" style="display:none">
+    <div class="rsm-loading">Cargando resumen&hellip;</div>
+  </div>
+</div>
+
+<div class="overlay" id="overlay" onclick="closePanel()"></div>
+<aside class="panel" id="panel">
+  <div class="ph"><h2 id="panelTitle"></h2><button class="close" onclick="closePanel()">&times;</button></div>
+  <div class="pb" id="panelBody"></div>
+</aside>
+
+<div class="modal-ov" id="addOv" onclick="if(event.target===this)closeAddUser()">
+  <div class="modal">
+    <div class="modal-h"><h2>Agregar usuario</h2><button class="close2" onclick="closeAddUser()">&times;</button></div>
+    <div class="modal-b">
+      <div class="mfield"><label>Correo</label><input id="newEmail" placeholder="correo@payjoy.com"></div>
+      <div class="mfield"><label>Rol</label><select id="newRole"></select></div>
+      <div class="mactions">
+        <button class="btn sm grey" onclick="closeAddUser()">Cancelar</button>
+        <button class="btn sm" onclick="addUserConfirm()">A&ntilde;adir</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-ov" id="calcOv" onclick="if(event.target===this)closeCalcModal()">
+  <div class="modal">
+    <div class="modal-h"><h2 id="calcTitle">Nuevo calculado</h2><button class="close2" onclick="closeCalcModal()">&times;</button></div>
+    <div class="modal-b" id="calcBody"></div>
+  </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.0/Sortable.min.js"></script>
+<script>
+  var PAGE = 60;
+  var STATE = { all: [], filtered: [], shown: 0, cfg: { TITLE_COL:'', CARD_COLS:[] }, viewAs: null, role: 'usuario',
+    filters: { sinVisita:false, fpd7:false, fpd15:false, dif:false, habilitado:'', tipo:'' },
+    habValues: [], tipoValues: [] };
+  var ZLINK = {
+    ACCOUNT_BASE:       'https://crm.zoho.com/crm/org652147581/tab/Accounts/',
+    VISITA_CREATE_BASE: 'https://crm.zoho.com/crm/org652147581/tab/CustomModule120/create?redirect=false&layoutId=',
+    LAYOUT_USUARIO:     '2743037000716292537',   // ejecutivo crea la visita
+    LAYOUT_SUPERIOR:    '2743037000726677194',    // supervisor / admin / maestro
+    VISITA_VIEW:        'https://crm.zoho.com/crm/org652147581/tab/CustomModule120/'
+  };
+  // El layout depende del ROL REAL de quien crea (no del rol "visto"): en "Ver como",
+  // quien crea el registro en Zoho es el supervisor/maestro con su propia sesion.
+  function visitaCreateUrl(){
+    // En "Ver como" usa el rol SIMULADO (viewingRole); fuera de eso, tu rol real.
+    var st = window.STATE || {};
+    var r = String((st.viewAs ? st.viewingRole : st.role) || 'usuario').toLowerCase();
+    return ZLINK.VISITA_CREATE_BASE + (r === 'usuario' ? ZLINK.LAYOUT_USUARIO : ZLINK.LAYOUT_SUPERIOR);
+  }
+  var ADMIN = null;
+  var LAST_DETAIL = null;   // { key, res } — solo la última tienda abierta
+  var PREV_VIEW = 'tiendas';   // módulo desde el que se abrió Usuarios/Campos
+  function volverModulo(){
+    if (!camposGuard()) return;
+    if (PREV_VIEW === 'resumen') showResumen();
+    else if (PREV_VIEW === 'visitas') showVisitas();
+    else showStores();
+  }  
+    function currentView_(){
+    var rv = document.getElementById('rsmView');
+    if (rv && rv.style.display !== 'none') return 'resumen';
+    var vv = document.getElementById('visitasView');
+    if (vv && vv.style.display !== 'none') return 'visitas';
+    return 'tiendas';
+  }
+  var LOGO = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAbgAAABQCAYAAABrqmDoAABP20lEQVR42u19eZxcVZX/99x733tV1Z0EEAKOgus4TodxAQYQklQ34riNjs74ygUERzBhCxFDFnB5/RyFrGxZSKI442055191YY43ZVjR2FlG8i7VNMZ7XHRysbAy9onc9RxlIisWXNldm2Nldm2N9Ym2Z8oPP7lIisWXbllNS7Uy1XBEEQVBBFEURTEEURFEIQRElEEEURFHIRERBFERQxCEIQRAEQRAEQRAERBHFhHZlVy9UBEFJlERBBHFHFH9tOBcHNOWCPPWKZOhTMkOhQEAAAKSKZOhTMkOhQGAAgADOJlUL4jFdOwFAAAAAElFTkSuQmCC';
+  var LOADING_HTML = '<div class="loading-logo"><img src="' + LOGO + '" alt="PayJoy"><span>Cargando&hellip;</span></div>';
+  var ICON_EYE = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+  var ICON_X   = '<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><line x1="5" y1="5" x2="19" y2="19"/><line x1="19" y1="5" x2="5" y2="19"/></svg>';
+  var ICON_EDIT = '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+
+  function hideBoot(){ var g=document.getElementById('bootGate'); if(g) g.style.display='none'; }
+  (function(){ var b=document.getElementById('bootLogo'); if(b) b.src = LOGO; })();  
+
+  /* ---------- menu del correo ---------- */
+  function buildMenu(){
+    var m = document.getElementById('userMenu');
+    if (STATE.role === 'maestro'){
+      m.innerHTML = '<div class="mtitle">Administraci&oacute;n</div>' +
+        '<button onclick="menuGo(\'usuarios\')">Usuarios</button>' +
+        '<button onclick="menuGo(\'campos\')">Campos</button>';
+    } else if (STATE.role === 'supervisor'){
+      m.innerHTML = '<div class="mtitle">Administraci&oacute;n</div><button onclick="menuGo(\'usuarios\')">Mis ejecutivos</button>';
+    } else {
+      m.innerHTML = '<div class="mempty">Sin m&oacute;dulos disponibles</div>';
+    }
+  }
+  function toggleMenu(ev){
+    ev.stopPropagation();
+    buildMenu();
+    document.getElementById('userMenu').classList.toggle('open');
+  }
+  function menuGo(key){
+    document.getElementById('userMenu').classList.remove('open');
+    if (!camposGuard()) return;
+    PREV_VIEW = currentView_();            // <-- recuerda dónde estabas
+    if (key === 'usuarios') showUsers();
+    else if (key === 'campos') showCampos();
+  }
+
+  /* ---------- barra lateral de módulos ---------- */
+  function openNav(ev){
+    if (ev) ev.stopPropagation();
+    document.getElementById('navOverlay').classList.add('open');
+    document.getElementById('navPanel').classList.add('open');
+    document.body.classList.add('no-scroll');
+  }
+  function closeNav(){
+    document.getElementById('navOverlay').classList.remove('open');
+    document.getElementById('navPanel').classList.remove('open');
+    document.body.classList.remove('no-scroll');
+  }
+  function navGo(mod){
+    if (!camposGuard()) return;      // no salir de Campos con cambios sin guardar
+    closeNav();
+    if (mod === 'tiendas') showStores();
+    else if (mod === 'visitas') showVisitas();
+  }
+  function updateNavActive(mod){
+    var t = document.getElementById('navTiendas'), v = document.getElementById('navVisitas');
+    if (t) t.classList.toggle('active', mod === 'tiendas');
+    if (v) v.classList.toggle('active', mod === 'visitas');
+  }
+
+  /* Aviso al salir del gestor de Campos con cambios sin guardar. */
+  function camposGuard(){
+    var cv = document.getElementById('camposView');
+    if (cv && cv.style.display !== 'none' && CAMPOS_STATE.length &&
+        JSON.stringify(camposProjection()) !== CAMPOS_SNAP){
+      return confirm('Tienes cambios sin guardar en Campos. \u00bfSalir y descartarlos?');
+    }
+    return true;
+  }
+  function volverTiendas(){ if (camposGuard()) showStores(); }
+
+  /* ---------- módulo Visitas (agenda semanal) ---------- */
+  function showVisitas(){
+    document.getElementById('storeView').style.display = 'none';
+    document.getElementById('usersView').style.display = 'none';
+    document.getElementById('camposView').style.display = 'none';
+    var vv = document.getElementById('visitasView');
+    vv.style.display = '';
+    vv.innerHTML = LOADING_HTML;
+    updateNavActive('visitas');
+    google.script.run.withSuccessHandler(renderVisitas)
+      .withFailureHandler(function(err){ vv.innerHTML = '<div class="empty">' + (err && err.message ? err.message : 'Error') + '</div>'; })
+      .getVisitas(STATE.viewAs || null);
+  }
+
+  function renderVisitas(d){
+    var verEje = (d.role === 'supervisor' || d.role === 'maestro' || d.role === 'admin');
+    var total = 0;
+    var cols = (d.days || []).map(function(day){
+      total += day.visitas.length;
+      var cuerpo = day.visitas.length
+        ? day.visitas.map(function(v){ return visitaCard(v, verEje); }).join('')
+        : '<div class="vempty">Sin visitas</div>';
+      var count = day.visitas.length ? '<span class="daycount">' + day.visitas.length + '</span>' : '';
+      return '<div class="day' + (day.esHoy ? ' today' : '') + '">' +
+        '<div class="dayhead">' + esc(day.label) + count + '</div>' +
+        '<div class="daybody">' + cuerpo + '</div></div>';
+    }).join('');
+    document.getElementById('visitasView').innerHTML =
+      '<div class="uhead"><h2>Visitas de la semana</h2>' +
+        '<span class="ulabel" style="margin-left:auto">' + total + ' programada' + (total === 1 ? '' : 's') + '</span></div>' +
+      '<div class="week">' + cols + '</div>';
+  }
+
+  function visitaCard(v, verEje){
+    var nombre = v.merchant || v.merchantId || '\u2014';
+    var estadoPill = v.estado ? '<span class="pill pill-neu">' + esc(v.estado) + '</span>' : '';
+    var eje = (verEje && v.ejecutivo) ? '<div class="veje">' + esc(v.ejecutivo) + '</div>' : '';
+    var clickable = !!v.id;
+    var attrs = clickable ? ' onclick="abrirVisita(\'' + escJs(v.id) + '\')"' : '';
+    return '<div class="vcard' + (clickable ? '' : ' vcard-off') + '"' + attrs + '>' +
+      '<div class="vname">' + esc(nombre) + '</div>' +
+      (v.tipo ? '<div class="vmeta">' + esc(v.tipo) + '</div>' : '') +
+      (estadoPill ? '<div class="vpills">' + estadoPill + '</div>' : '') +
+      eje +
+    '</div>';
+  }
+  function abrirVisita(id){ if (id) window.open(ZLINK.VISITA_VIEW + encodeURIComponent(id), '_blank', 'noopener'); }
+  document.addEventListener('click', function(){
+    document.getElementById('userMenu').classList.remove('open');
+    var am = document.getElementById('actMenu'); if (am) am.classList.remove('open');
+  });
+
+  /* ---------- carga de tiendas ---------- */
+  // loadData ahora delega en la carga unificada (una sola lectura del servidor).
+  // Aterriza en Tiendas: asi "Ver como" (verComo) y "Salir de esta vista" siguen mostrando tiendas.
+  function loadData(viewAs){ bootstrap(viewAs || null, 'tiendas'); }
+  // (La carga inicial ya no se dispara aqui; bootstrap(null,'resumen') se llama al final del ultimo script.)
+
+  function onData(res){
+    console.log('onData ->', JSON.stringify(res && {role:res.role, email:res.email}));
+    if (typeof applyGate === 'function' && applyGate(res.role)) return;
+        STATE.all = res.rows; STATE.cfg = res.config; STATE.viewAs = res.viewingAs || null; STATE.role = res.role; STATE.viewingRole = res.viewingRole || res.role;
+    document.getElementById('userChip').innerHTML = (res.email || 'Sin sesi&oacute;n') + ' <span class="caret">&#9660;</span>';
+    document.getElementById('roleBadge').textContent = res.role || 'usuario';
+
+    var b = document.getElementById('viewBanner');
+    if (res.viewingAs){
+      b.style.display = 'flex';
+      document.getElementById('viewBannerText').textContent = 'Viendo como ' + res.viewingAs + ' (rol ' + res.viewingRole + ')';
+    } else { b.style.display = 'none'; }
+
+    // Precarga la lista de usuarios en segundo plano (solo maestro) para abrir el modulo al instante
+    if (res.role === 'maestro' && !ADMIN){
+      google.script.run.withSuccessHandler(function(d){ ADMIN = d; }).getAdminData();
+    }
+
+    // Filtros: reinicia y arma la barra con los valores reales de la data.
+    STATE.filters = { sinVisita:false, fpd7:false, fpd15:false, dif:false, habilitado:'', tipo:'' };
+    computeFilterValues();
+    renderFilterBar();
+
+    applySearch();
+    hideBoot();  
+  }
+
+  function computeFilterValues(){
+    var habs = {}, tipos = {};
+    STATE.all.forEach(function(r){
+      if (r.habilitado) habs[r.habilitado] = true;
+      if (r.tipo) tipos[r.tipo] = true;
+    });
+    STATE.habValues = Object.keys(habs).sort();
+    STATE.tipoValues = Object.keys(tipos).sort();
+  }
+
+  /* ---------- barra de filtros (etiquetas especiales, en el cliente) ---------- */
+  function toggleFilters(){
+    var p = document.getElementById('filterPanel');
+    p.style.display = (!p.style.display || p.style.display === 'none') ? 'block' : 'none';
+  }
+  function renderFilterBar(){
+    var f = STATE.filters;
+    function chip(key, label){
+      return '<button class="fchip' + (f[key] ? ' on' : '') + '" onclick="toggleFilterChip(\'' + key + '\',this)">' + label + '</button>';
+    }
+    function sel(key, label, vals){
+      var opts = '<option value="">Todos</option>' + vals.map(function(v){
+        return '<option value="' + esc(v) + '"' + (f[key] === v ? ' selected' : '') + '>' + esc(v) + '</option>';
+      }).join('');
+      return '<label class="fsel">' + label + ' <select onchange="setFilter(\'' + key + '\',this.value)">' + opts + '</select></label>';
+    }
+    document.getElementById('filterPanel').innerHTML =
+      '<div class="fchips">' +
+        chip('sinVisita','Sin visita') + chip('fpd7','FPD7 rojo') + chip('fpd15','FPD15 rojo') + chip('dif','Dif. mensual rojo') +
+      '</div>' +
+      '<div class="fsels">' + sel('habilitado','Habilitado', STATE.habValues) + sel('tipo','Tipo de tienda', STATE.tipoValues) + '</div>' +
+      '<div class="fclear"><button class="linkbtn" onclick="clearFilters()">Limpiar filtros</button></div>';
+    updateFilterCount();
+  }
+  function toggleFilterChip(key, btn){ STATE.filters[key] = !STATE.filters[key]; btn.classList.toggle('on'); applySearch(); updateFilterCount(); }
+  function setFilter(key, val){ STATE.filters[key] = val; applySearch(); updateFilterCount(); }
+  function clearFilters(){
+    STATE.filters = { sinVisita:false, fpd7:false, fpd15:false, dif:false, habilitado:'', tipo:'' };
+    renderFilterBar(); applySearch();
+  }
+  function updateFilterCount(){
+    var f = STATE.filters, n = 0;
+    ['sinVisita','fpd7','fpd15','dif'].forEach(function(k){ if (f[k]) n++; });
+    if (f.habilitado) n++; if (f.tipo) n++;
+    var btn = document.getElementById('filterBtn');
+    if (btn) btn.textContent = n ? ('Filtros (' + n + ')') : 'Filtros';
+  }
+
+  function onError(err){
+    document.getElementById('grid').innerHTML =
+      '<div class="empty">No se pudo cargar la data.<br>' + (err && err.message ? err.message : '') + '</div>';
+  }
+
+  function val(row, key){
+    var v = row[key];
+    return (v === null || v === undefined || v === '') ? '\u2014' : v;
+  }
+  function esc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+  function escJs(s){ return String(s==null?'':s).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+
+  /* ---------- render con paginacion + filtros ---------- */
+  function applySearch(){
+    var q = document.getElementById('search').value.trim().toLowerCase();
+    var f = STATE.filters;
+    STATE.filtered = STATE.all.filter(function(r){
+      // filtros de etiqueta especial (combinan con TODOS / AND)
+      if (f.sinVisita && !r.sinVisita) return false;
+      if (f.fpd7 && !(r.fpd7 && r.fpd7.sem === 'bad')) return false;
+      if (f.fpd15 && !(r.fpd15 && r.fpd15.sem === 'bad')) return false;
+      if (f.dif && !(r.dif && r.dif.sem === 'bad')) return false;
+      if (f.habilitado && r.habilitado !== f.habilitado) return false;
+      if (f.tipo && (r.tipo || '') !== f.tipo) return false;
+      // búsqueda de texto
+      if (q){
+        if (r._s === undefined) r._s = (r.merchant+' '+r.admin+' '+r.owner+' '+r.supervisor+' '+r.procedencia+' '+r.tipo+' '+r.habilitado).toLowerCase();
+        if (r._s.indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+    document.getElementById('grid').innerHTML = '';
+    STATE.shown = 0;
+    if (!STATE.filtered.length){ document.getElementById('grid').innerHTML = '<div class="empty">No hay tiendas para mostrar.</div>'; return; }
+    renderMore();
+  }
+
+  function renderMore(){
+    if (STATE.shown >= STATE.filtered.length) return;
+    var list = STATE.filtered;
+    var end = Math.min(STATE.shown + PAGE, list.length);
+    var html = '';
+    for (var i = STATE.shown; i < end; i++){
+      var r = list[i];
+      var borde = r.borde ? 'border:2px solid #E24B4A;' : '';
+      var badge = r.sinVisita ? '<div class="badge-visita">Sin visita</div>' : '';
+      var habPill = '<span class="pill ' + (r.habilitado === 'HABILITADO' ? 'pill-ok' : 'pill-bad') + '">' + esc(cap(r.habilitado)) + '</span>';
+      var tipoPill = r.tipo ? '<span class="pill ' + (r.churn ? 'pill-bad' : 'pill-neu') + '">' + esc(cap(r.tipo)) + '</span>' : '';
+      html += '<div class="card" style="position:relative;' + borde + '" onclick="openPanel(' + r._row + ')">' +
+                badge +
+                '<div class="c-title">' + esc(r.merchant) + '</div>' +
+                '<div class="c-sub" style="margin-bottom:8px">' + esc(r.admin) + '</div>' +
+                '<div class="c-pills" style="margin:0 0 10px">' + habPill + tipoPill + '</div>' +
+                '<div class="c-sem">' + ventaBlock('Ventas', r.ventaMes) + semBlock('Dif. mensual', r.dif) + semBlock('FPD7', r.fpd7) + semBlock('FPD15', r.fpd15) + '</div>' +
+                '<div class="c-foot"><div>' + esc(r.procedencia || '\u2014') + '</div>' +
+                  '<div>' + esc(r.owner || '\u2014') + '</div>' +
+                  '<div><span class="mut">sup.</span> ' + esc(r.supervisor || '\u2014') + '</div></div>' +
+              '</div>';
+    }
+    document.getElementById('grid').insertAdjacentHTML('beforeend', html);
+    STATE.shown = end;
+  }
+  var SEMC = { ok:'#639922', warn:'#EF9F27', bad:'#E24B4A', na:'#B4B2A9' };
+  function semBlock(label, m){
+    m = m || { sem:'na', txt:'\u2014' };
+    return '<div class="sem"><div class="sem-l">' + label + '</div><div class="sem-v">' + dot(m.sem) + esc(m.txt) + '</div></div>';
+  }
+  function ventaBlock(label, txt){
+    return '<div class="sem"><div class="sem-l">' + label + '</div><div class="sem-v">' + esc(txt || '\u2014') + '</div></div>';
+  }
+  function dot(sem){ return '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + (SEMC[sem] || SEMC.na) + ';margin-right:5px"></span>'; }
+  function cap(s){ s = String(s == null ? '' : s).trim(); return s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : ''; }
+
+  var io = new IntersectionObserver(function(entries){
+    entries.forEach(function(e){ if (e.isIntersecting) renderMore(); });
+  }, { rootMargin: '400px' });
+  io.observe(document.getElementById('sentinel'));
+
+  /* ---------- detalle: resumen instantaneo + detalle completo ---------- */
+  function openPanel(rowNumber){
+    var key = (STATE.viewAs || '') + '|' + rowNumber;
+    document.getElementById('overlay').classList.add('open');
+    document.getElementById('panel').classList.add('open');
+    document.body.classList.add('no-scroll');
+
+    if (LAST_DETAIL && LAST_DETAIL.key === key) { renderDetail(LAST_DETAIL.res); return; }  // misma que la última
+
+    document.getElementById('panelTitle').textContent = 'Detalle';
+    document.getElementById('panelBody').innerHTML =
+      '<div class="loading-logo" style="min-height:40vh"><img src="' + LOGO + '" alt="PayJoy"><span>Cargando\u2026</span></div>';
+
+    google.script.run.withSuccessHandler(function(res){
+      LAST_DETAIL = { key: key, res: res };
+      renderDetail(res);
+    }).withFailureHandler(function(err){
+      document.getElementById('panelBody').innerHTML = '<div style="padding:16px;color:#c0392b">' + (err && err.message ? err.message : 'Error') + '</div>';
+    }).getStoreDetail(rowNumber, STATE.viewAs);
+  }
+  function closePanel(){
+    document.getElementById('overlay').classList.remove('open');
+    document.getElementById('panel').classList.remove('open');
+    document.body.classList.remove('no-scroll');
+  }
+
+  /* ---------- acciones Zoho (panel de detalle) ---------- */
+  function actionsHtml(res){
+    var accId = String(res.zohoAccountId == null ? '' : res.zohoAccountId).trim();
+    var itemAcc = accId
+      ? '<a class="act-item" target="_blank" rel="noopener" href="' + ZLINK.ACCOUNT_BASE + encodeURIComponent(accId) + '">Account Zoho</a>'
+      : '<span class="act-item disabled">Account Zoho (sin ID)</span>';
+    var itemVis = '<a class="act-item" target="_blank" rel="noopener" href="' + visitaCreateUrl() + '">Crear visita</a>';
+    return '<div class="actions">' +
+             '<button class="btn act-btn" onclick="toggleActions(event)">Acciones <span class="caret">&#9660;</span></button>' +
+             '<div class="act-menu" id="actMenu">' + itemAcc + itemVis + '</div>' +
+           '</div>';
+  }
+  function toggleActions(ev){
+    ev.stopPropagation();
+    document.getElementById('actMenu').classList.toggle('open');
+  }
+
+  function renderDetail(res){
+    document.getElementById('panelTitle').textContent = res.title || 'Detalle';
+    var fields = (res.fields || []).map(function(f){
+      var v = (f.v === '' || f.v == null) ? '\u2014' : esc(f.v);
+      var pre = f.sem ? dot(f.sem) : '';   // semáforo: círculo de color primero, luego la banda
+      return '<div class="detail"><div class="k">' + esc(f.k) + '</div><div class="v">' + pre + v + '</div></div>';
+    }).join('');
+    document.getElementById('panelBody').innerHTML = actionsHtml(res) + fields + clerksHtml(res.clerks);
+  }
+
+   // Sección de vendedores (clerks) al final del detalle. Ordenados desde Hex.
+  function clerksHtml(list){
+    list = list || [];
+    var head = '<div class="clerk-head">Vendedores <span style="color:#a7aea7">(' + list.length + ')</span></div>';
+    if (!list.length){
+      return head + '<div class="clerk-empty">Sin vendedores registrados</div>';
+    }
+    var rows = list.map(function(c){
+      var inact = (c.activo === false);
+      var tag = inact ? '<span class="clerk-tag">inactivo</span>' : '';
+      var sub = c.movido ? '<div class="clerk-sub">ahora en ' + esc(c.movido) + '</div>' : '';
+      return '<div class="clerk-row' + (inact ? ' inactivo' : '') + '">' +
+          '<div class="clerk-name">' + esc(c.nombre) + tag + sub + '</div>' +
+          '<div class="clerk-metrics">' +
+            '<div class="clerk-und">' + esc(String(c.und)) + ' <span class="clerk-u">und</span></div>' +
+            '<div class="clerk-mora">' + dot(c.sem) + esc(c.mora) + '</div>' +
+          '</div>' +
+        '</div>';
+    }).join('');
+    return head + rows;
+  }
+
+  function fuseC(a,b){ a=(a==null?'':String(a)).trim(); b=(b==null?'':String(b)).trim(); return (a&&b)?(a+' - '+b):(a||b); }
+  /* ---------- vistas ---------- */
+  function showStores(){
+    document.getElementById('usersView').style.display = 'none';
+    var cv = document.getElementById('camposView'); if (cv) cv.style.display = 'none';
+    var vv = document.getElementById('visitasView'); if (vv) vv.style.display = 'none';
+    document.getElementById('storeView').style.display = '';
+    updateNavActive('tiendas');
+  }
+  function showUsers(){
+    if (STATE.role !== 'maestro' && STATE.role !== 'supervisor') return;
+    document.getElementById('storeView').style.display = 'none';
+    var cvv = document.getElementById('camposView'); if (cvv) cvv.style.display = 'none';
+    var vvu = document.getElementById('visitasView'); if (vvu) vvu.style.display = 'none';
+    var uv = document.getElementById('usersView');
+    uv.style.display = '';
+
+    if (STATE.role === 'supervisor'){
+      uv.innerHTML = LOADING_HTML;
+      google.script.run.withSuccessHandler(renderSupervisorUsers)
+        .withFailureHandler(function(err){ uv.innerHTML = '<div class="empty">' + (err && err.message ? err.message : 'Error') + '</div>'; })
+        .getSupervisorUsers();
+      return;
+    }
+
+    if (ADMIN) { renderUsersView(ADMIN); } else { uv.innerHTML = LOADING_HTML; }
+    google.script.run.withSuccessHandler(function(d){ ADMIN = d; renderUsersView(d); })
+      .withFailureHandler(function(err){ if (!ADMIN) uv.innerHTML = '<div class="empty">' + (err && err.message ? err.message : 'Error') + '</div>'; })
+      .getAdminData();
+  }
+
+  function renderUsersView(d){
+    ADMIN = d;
+    document.getElementById('usersView').innerHTML =
+      '<div class="uhead"><button class="btn sm" style="background:var(--green-d)" onclick="volverModulo()">&larr; Volver</button><h2>Usuarios</h2></div>' +
+      '<div class="utoolbar"><input class="search" id="userSearch" placeholder="Buscar usuario&hellip;" oninput="renderUsersRows()" style="max-width:280px">' +
+        '<button class="iconbtn add" title="Agregar usuario" onclick="openAddUser()">+</button></div>' +
+      '<div class="tablewrap"><table class="utable"><thead><tr>' +
+        '<th>Correo</th><th>Rol</th><th>Visualizar</th><th>Eliminar</th></tr></thead>' +
+        '<tbody id="usersTbody"></tbody></table></div>';
+    renderUsersRows();
+  }
+
+  function renderUsersRows(){
+    var d = ADMIN;
+    function roleOpts(sel){ return d.rolesValidos.map(function(o){ return '<option value="' + o + '"' + (o === sel ? ' selected' : '') + '>' + o + '</option>'; }).join(''); }
+    var qEl = document.getElementById('userSearch');
+    var q = qEl ? qEl.value.trim().toLowerCase() : '';
+    var lista = !q ? d.roles : d.roles.filter(function(u){
+      return u.correo.toLowerCase().indexOf(q) > -1 || String(u.rol).toLowerCase().indexOf(q) > -1;
+    });
+    var rowsHtml = lista.map(function(u){
+      var esMaestro = (u.rol === 'maestro');          // bloquea acciones en filas maestro
+      var baja  = (u.estado === 'BAJA');
+      var trClass = baja ? ' class="deleted"' : '';
+      var rolCell = (esMaestro || baja)
+        ? '<span class="rolefix">' + u.rol + (u.correo === d.maestro ? ' (fijo)' : '') + '</span>'
+        : '<select onchange="changeRole(\'' + u.correo + '\', this.value)">' + roleOpts(u.rol) + '</select>';
+      var eyeCell = (esMaestro || baja)
+        ? '<span class="rolefix">\u2014</span>'
+        : '<button class="iconbtn eye" title="Ver como" onclick="verComo(\'' + u.correo + '\')">' + ICON_EYE + '</button>';
+      var delCell = (esMaestro || baja)
+        ? '<span class="rolefix">' + (baja ? 'baja' : '\u2014') + '</span>'
+        : '<button class="iconbtn del" title="Dar de baja" onclick="delUser(\'' + u.correo + '\', this)">' + ICON_X + '</button>';
+      return '<tr' + trClass + ' data-email="' + u.correo + '"><td class="em">' + u.correo + '</td><td>' + rolCell + '</td>' +
+             '<td class="ic">' + eyeCell + '</td><td class="ic">' + delCell + '</td></tr>';
+    }).join('') || '<tr><td colspan="4" style="padding:16px;color:var(--muted)">Sin resultados.</td></tr>';
+    document.getElementById('usersTbody').innerHTML = rowsHtml;
+  }
+
+  function changeRole(email, role){
+    google.script.run.withSuccessHandler(function(d){ ADMIN = d; renderUsersView(d); }).withFailureHandler(onError).setUserRole(email, role);
+  }
+  function delUser(email, btn){
+    if (!confirm('\u00bfDar de baja a ' + email + '? Quedar\u00e1 bloqueado y sin acceso hasta reactivarlo en el Sheet.')) return;
+    google.script.run.withSuccessHandler(function(){
+      var tr = btn.closest('tr');
+      tr.classList.add('deleted');
+      tr.querySelectorAll('select, button').forEach(function(el){ el.disabled = true; });
+      if (ADMIN && ADMIN.roles){ ADMIN.roles.forEach(function(u){ if (u.correo === email) u.estado = 'BAJA'; }); }
+    }).withFailureHandler(onError).removeUser(email);
+  }
+  function verComo(email){ if (email) loadData(email); }
+  function renderSupervisorUsers(d){
+    var rows = d.roles.map(function(u){
+      return '<tr data-email="' + u.correo + '"><td class="em">' + u.correo + '</td>' +
+             '<td class="ic"><button class="iconbtn eye" title="Ver sus tiendas" onclick="verComo(\'' + u.correo + '\')">' + ICON_EYE + '</button></td></tr>';
+    }).join('') || '<tr><td colspan="2" style="padding:16px;color:var(--muted)">No tienes ejecutivos asignados.</td></tr>';
+    document.getElementById('usersView').innerHTML =
+      '<div class="uhead"><button class="btn sm" style="background:var(--green-d)" onclick="volverModulo()">&larr; Volver</button><h2>Mis ejecutivos</h2></div>' +
+      '<div class="utoolbar"><span class="ulabel">Ejecutivos a tu cargo</span></div>' +
+      '<div class="tablewrap"><table class="utable"><thead><tr><th>Correo</th><th>Visualizar</th></tr></thead><tbody>' + rows + '</tbody></table></div>';
+  }
+
+  /* ---------- modal agregar ---------- */
+  function openAddUser(){
+    document.getElementById('newEmail').value = '';
+    document.getElementById('newRole').innerHTML =
+      ADMIN.rolesValidos.map(function(o){ return '<option value="' + o + '">' + o + '</option>'; }).join('');
+    document.getElementById('addOv').classList.add('open');
+  }
+  function closeAddUser(){ document.getElementById('addOv').classList.remove('open'); }
+  function addUserConfirm(){
+    var e = document.getElementById('newEmail').value.trim();
+    var r = document.getElementById('newRole').value;
+    if (!e){ alert('Ingresa un correo.'); return; }
+    google.script.run.withSuccessHandler(function(d){ ADMIN = d; closeAddUser(); renderUsersView(d); }).withFailureHandler(onError).setUserRole(e, r);
+  }
+
+  /* ---------- gestor de campos (CONFIG_CAMPOS + calculados) ---------- */
+  var CAMPOS_FORMATOS = ['TEXTO','ENTERO','DECIMAL','PORCENTAJE','FECHA'];
+  var CAMPOS_STATE = [];     // estado vivo de las filas
+  var CAMPOS_SNAP  = '[]';   // "foto" para el guardado inteligente
+  var CAMPOS_QUERY = '';     // texto de búsqueda actual
+  var CAMPOS_SORT  = null;   // instancia de Sortable
+  var CAMPOS_COLS = [], CAMPOS_RECETAS = [], CAMPOS_TIPOS = ['semaforo','semaforo_inv','concatenado'], CAMPOS_UNIDADES = ['porcentaje','numero'];
+  var CALC_EDIT = null;      // clave en edición (null = crear)
+  var CALC_VALS = {};        // valores actuales del modal (prefill)
+  var CALC_CONCAT = [];      // columnas del concatenado, en orden
+  function normU(s){ return String(s==null?'':s).trim().toUpperCase(); }
+
+  function showCampos(){
+    if (STATE.role !== 'maestro') return;
+    document.getElementById('storeView').style.display = 'none';
+    document.getElementById('usersView').style.display = 'none';
+    var vvc = document.getElementById('visitasView'); if (vvc) vvc.style.display = 'none';
+    var cv = document.getElementById('camposView');
+    cv.style.display = '';
+    cv.innerHTML = LOADING_HTML;
+    google.script.run.withSuccessHandler(renderCamposManager)
+      .withFailureHandler(function(err){ cv.innerHTML = '<div class="empty">' + (err && err.message ? err.message : 'Error') + '</div>'; })
+      .getCamposManager();
+  }
+
+  function camposProjection(){
+    return CAMPOS_STATE.map(function(it){
+      return { columna: it.columna, etiqueta: it.etiqueta, enDetalle: !!it.enDetalle, formato: it.formato, protegida: !!it.protegida };
+    });
+  }
+  function refreshSaveBtn(){
+    var btn = document.getElementById('saveCamposBtn');
+    if (!btn) return;
+    btn.disabled = (JSON.stringify(camposProjection()) === CAMPOS_SNAP);
+  }
+
+  function renderCamposManager(d){
+    CAMPOS_FORMATOS = d.formatos || CAMPOS_FORMATOS;
+    CAMPOS_COLS     = d.columnasReales || [];
+    CAMPOS_RECETAS  = d.recetas || [];
+    CAMPOS_TIPOS    = d.tipos || ['semaforo','semaforo_inv','concatenado'];
+    CAMPOS_UNIDADES = d.unidades || ['porcentaje','numero'];
+    CAMPOS_QUERY = '';
+    var idc = 0;
+    CAMPOS_STATE = (d.items || []).map(function(it){
+      return { _id: idc++, columna: it.columna, etiqueta: it.etiqueta || '', enDetalle: !!it.enDetalle,
+               formato: it.formato || 'TEXTO', protegida: !!it.protegida, estado: it.estado || 'ok',
+               alerta: it.alerta || '', sub: it.sub || '' };
+    });
+    CAMPOS_SNAP = JSON.stringify(camposProjection());
+    document.getElementById('camposView').innerHTML =
+      '<div class="uhead"><button class="btn sm" style="background:var(--green-d)" onclick="volverModulo()">&larr; Volver</button>' +
+        '<h2>Campos del detalle</h2>' +
+        '<button class="btn sm grey" style="margin-left:auto" onclick="openCalcModal(null)">+ Nuevo calculado</button>' +
+        '<button class="btn sm" id="saveCamposBtn" disabled onclick="saveCampos()">Guardar</button></div>' +
+      '<div class="utoolbar"><input class="search" id="camposSearch" placeholder="Buscar campo&hellip;" oninput="camposFilter(this.value)" style="max-width:280px"></div>' +
+      '<div class="chint">Arrastra con &#9776; o escribe el n&uacute;mero para reordenar (el n&uacute;mero es la posici&oacute;n global). Con b&uacute;squeda activa el arrastre se desactiva. Guardar se habilita solo si hay cambios.</div>' +
+      '<div class="tablewrap"><table class="ctable"><thead><tr>' +
+        '<th class="c-h"></th><th class="c-n">#</th><th>Columna</th><th>Etiqueta</th><th>Formato</th>' +
+        '<th class="c-c">Ver</th><th class="c-c">Sensible</th><th class="c-c"></th>' +
+      '</tr></thead><tbody id="fieldList"></tbody></table></div>';
+    renderCamposRows();
+  }
+
+  function renderCamposRows(){
+    var html = '';
+    for (var i = 0; i < CAMPOS_STATE.length; i++){ html += camposRowHtml(CAMPOS_STATE[i], i + 1); }
+    document.getElementById('fieldList').innerHTML = html;
+    if (CAMPOS_SORT){ CAMPOS_SORT.destroy(); CAMPOS_SORT = null; }
+    if (!CAMPOS_QUERY && window.Sortable){
+      CAMPOS_SORT = Sortable.create(document.getElementById('fieldList'), {
+        handle: '.fdrag', animation: 150, ghostClass: 'fdrag-ghost',
+        onChoose: function(evt){ var c = evt.item.children; for (var j=0;j<c.length;j++){ c[j].style.width = c[j].offsetWidth + 'px'; } },
+        onEnd: function(evt){
+          var c = evt.item.children; for (var j=0;j<c.length;j++){ c[j].style.width = ''; }
+          var trs = document.querySelectorAll('#fieldList tr.frow');
+          var byId = {}; for (var s=0;s<CAMPOS_STATE.length;s++){ byId[CAMPOS_STATE[s]._id] = CAMPOS_STATE[s]; }
+          var next = []; for (var t=0;t<trs.length;t++){ var it = byId[Number(trs[t].getAttribute('data-id'))]; if (it) next.push(it); }
+          CAMPOS_STATE = next;
+          refreshSaveBtn();
+          setTimeout(renderCamposRows, 0); // refresca la numeración fuera del callback
+        }
+      });
+    }
+  }
+
+  function camposRowHtml(it, pos){
+    var esCalc = (it.estado === 'calculado' || it.estado === 'calculado_nuevo');
+    var badges = '';
+    if (esCalc) badges += '<span class="fbadge fcalc" title="Campo calculado">&fnof;</span>';
+    if (it.estado === 'nueva' || it.estado === 'calculado_nuevo') badges += '<span class="fbadge fnew">nueva</span>';
+    if (it.estado === 'huerfana') badges += '<span class="fbadge forph">hu&eacute;rfana' + (it.sub ? ' (' + it.sub + ')' : '') + '</span>';
+    var alerta = it.alerta ? '<div class="falert">&#9888; ' + esc(it.alerta) + '</div>' : '';
+    var fmtOpts = CAMPOS_FORMATOS.map(function(o){
+      return '<option value="' + o + '"' + (normU(o) === normU(it.formato) ? ' selected' : '') + '>' + cap(o) + '</option>';
+    }).join('');
+    var fmtCell = esCalc
+      ? '<span class="fmuted">por receta</span>'
+      : '<select class="ffmt" onchange="campoEdit(' + it._id + ',\'formato\',this.value)">' + fmtOpts + '</select>';
+    var acciones = '';
+    if (esCalc){
+      acciones = '<button class="iconbtn" title="Editar receta" onclick="openCalcModal(\'' + escJs(it.columna) + '\')">' + ICON_EDIT + '</button>' +
+                 '<button class="iconbtn del" title="Borrar receta" onclick="deleteCalc(\'' + escJs(it.columna) + '\')">' + ICON_X + '</button>';
+    } else if (it.estado === 'huerfana'){
+      acciones = '<button class="iconbtn del" title="Quitar de la config" onclick="quitarCampo(' + it._id + ')">' + ICON_X + '</button>';
+    }
+    var q = CAMPOS_QUERY;
+    var match = !q || (String(it.columna).toLowerCase().indexOf(q) > -1) || (String(it.etiqueta).toLowerCase().indexOf(q) > -1);
+    var hidden = match ? '' : ' style="display:none"';
+    return '<tr class="frow' + (it.estado === 'huerfana' ? ' fhuerfana' : '') + '" data-id="' + it._id + '"' + hidden + '>' +
+      '<td class="c-h"><span class="fdrag' + (q ? ' off' : '') + '" title="Arrastrar">&#9776;</span></td>' +
+      '<td class="c-n"><input type="number" class="fpos" min="1" value="' + pos + '" onchange="campoMover(' + it._id + ',this.value)" title="Posici&oacute;n"></td>' +
+      '<td class="fcol">' + esc(it.columna) + badges + alerta + '</td>' +
+      '<td><input class="fet" placeholder="' + esc(it.columna) + '" value="' + esc(it.etiqueta) + '" oninput="campoEdit(' + it._id + ',\'etiqueta\',this.value)"></td>' +
+      '<td>' + fmtCell + '</td>' +
+      '<td class="c-c"><input type="checkbox" class="fdet"' + (it.enDetalle ? ' checked' : '') + ' onchange="campoEdit(' + it._id + ',\'enDetalle\',this.checked)"></td>' +
+      '<td class="c-c"><input type="checkbox" class="fprot"' + (it.protegida ? ' checked' : '') + ' onchange="campoEdit(' + it._id + ',\'protegida\',this.checked)"></td>' +
+      '<td class="c-c">' + acciones + '</td>' +
+    '</tr>';
+  }
+
+  function campoIndex(id){ for (var i=0;i<CAMPOS_STATE.length;i++){ if (CAMPOS_STATE[i]._id === id) return i; } return -1; }
+
+  function campoEdit(id, field, value){
+    var i = campoIndex(id);
+    if (i > -1){ CAMPOS_STATE[i][field] = value; refreshSaveBtn(); }
+  }
+
+  function campoMover(id, posStr){
+    var target = parseInt(posStr, 10);
+    var n = CAMPOS_STATE.length;
+    if (isNaN(target)){ renderCamposRows(); return; }
+    if (target < 1) target = 1; if (target > n) target = n;
+    var from = campoIndex(id);
+    if (from < 0){ renderCamposRows(); return; }
+    var item = CAMPOS_STATE.splice(from, 1)[0];
+    CAMPOS_STATE.splice(target - 1, 0, item);
+    renderCamposRows();
+    refreshSaveBtn();
+  }
+
+  function camposFilter(q){ CAMPOS_QUERY = String(q || '').trim().toLowerCase(); renderCamposRows(); }
+
+  function quitarCampo(id){
+    var i = campoIndex(id);
+    if (i < 0) return;
+    if (!confirm('\u00bfQuitar "' + CAMPOS_STATE[i].columna + '" de la configuraci\u00f3n?')) return;
+    CAMPOS_STATE.splice(i, 1);
+    renderCamposRows();
+    refreshSaveBtn();
+  }
+
+  function saveCampos(){
+    if (!CAMPOS_STATE.length){ alert('No hay campos para guardar.'); return; }
+    var items = [], protOn = [];
+    for (var i = 0; i < CAMPOS_STATE.length; i++){
+      var it = CAMPOS_STATE[i];
+      if (it.protegida && it.enDetalle) protOn.push(it.columna);
+      items.push({ columna: it.columna, etiqueta: String(it.etiqueta || '').trim(),
+                   enDetalle: !!it.enDetalle, formato: it.formato || 'TEXTO', protegida: !!it.protegida });
+    }
+    if (protOn.length){
+      if (!confirm('Vas a mostrar ' + protOn.length + ' campo(s) sensible(s) en el detalle:\n' + protOn.join(', ') + '\n\n\u00bfContinuar?')) return;
+    }
+    var btn = document.getElementById('saveCamposBtn');
+    if (btn){ btn.disabled = true; btn.textContent = 'Guardando\u2026'; }
+    LAST_DETAIL = null; // invalida el detalle cacheado en el cliente
+    google.script.run.withSuccessHandler(function(d){
+      renderCamposManager(d);
+    }).withFailureHandler(function(err){
+      var b = document.getElementById('saveCamposBtn'); if (b){ b.disabled = false; b.textContent = 'Guardar'; }
+      alert((err && err.message) ? err.message : 'Error al guardar.');
+    }).saveCampos(items);
+  }
+
+  /* ---------- modal de campo calculado (crear / editar / borrar receta) ---------- */
+  function colOptionsCalc(sel){
+    return CAMPOS_COLS.map(function(c){
+      return '<option value="' + esc(c) + '"' + (normU(c) === normU(sel) ? ' selected' : '') + '>' + esc(c) + '</option>';
+    }).join('');
+  }
+  function tipoLabel(t){
+  return t === 'semaforo' ? 'Sem\u00e1foro (alto = peor)'
+       : t === 'semaforo_inv' ? 'Sem\u00e1foro invertido (alto = mejor)'
+       : t === 'concatenado' ? 'Concatenado'
+       : t === 'formula' ? 'C\u00e1lculo / condici\u00f3n (f\u00f3rmula)' : t;
+  }
+  function origenOptionsCalc(sel){
+  var opts = CAMPOS_COLS.slice();
+  (CAMPOS_RECETAS||[]).forEach(function(r){ if (r.tipo === 'formula') opts.push(r.clave); });
+  return opts.map(function(c){ return '<option value="'+esc(c)+'"'+(normU(c)===normU(sel)?' selected':'')+'>'+esc(c)+'</option>'; }).join('');
+  }
+  function calcFormulaPreview(){
+    var el=document.getElementById('calcFormulaPrev'); if(!el) return;
+    var expr=(document.getElementById('calcFormula')||{}).value||'';
+    var ids=expr.match(/[A-Za-z_][A-Za-z0-9_]*/g)||[]; var uniq=[];
+    ids.forEach(function(x){ if(uniq.indexOf(x)<0) uniq.push(x); });
+    el.innerHTML = uniq.length ? uniq.map(function(c){ var ok=CAMPOS_COLS.some(function(k){return normU(k)===normU(c);});
+      return '<span class="chip">'+dot(ok?'ok':'bad')+esc(c)+(ok?'':' ?')+'</span>'; }).join('')
+      : '<span class="fmuted">Escribe la f\u00f3rmula\u2026</span>';
+  }
+  function openCalcModal(clave){
+    if (JSON.stringify(camposProjection()) !== CAMPOS_SNAP){
+      if (!confirm('Tienes cambios de orden/visibilidad sin guardar en el gestor.\nSe perder\u00e1n al abrir el editor (recarga desde el servidor).\n\n\u00bfContinuar de todos modos?')) return;
+    }
+    CALC_EDIT = clave || null;
+    var rec = null;
+    if (CALC_EDIT){
+      for (var i = 0; i < CAMPOS_RECETAS.length; i++){
+        if (normU(CAMPOS_RECETAS[i].clave) === normU(CALC_EDIT)){ rec = CAMPOS_RECETAS[i]; break; }
+      }
+    }
+    var def = (rec && rec.definicion) ? rec.definicion : {};
+    CALC_VALS = {
+      clave:  rec ? rec.clave : '',
+      tipo:   rec ? rec.tipo : 'semaforo',
+      origen: rec ? rec.origen : (CAMPOS_COLS[0] || ''),
+      unidad: def.unidad || 'porcentaje',
+      formula: (rec && rec.definicion) ? (rec.definicion.formula || '') : '',
+      c1:     (def.corte1 != null) ? def.corte1 : '',
+      c2:     (def.corte2 != null) ? def.corte2 : '',
+      sep:    (def.separador != null) ? def.separador : ' - '
+    };
+    CALC_CONCAT = (def.columnas && def.columnas.length) ? def.columnas.slice() : [ (CAMPOS_COLS[0] || '') ];
+    document.getElementById('calcTitle').textContent = CALC_EDIT ? ('Editar: ' + CALC_VALS.clave) : 'Nuevo calculado';
+    renderCalcModal();
+    document.getElementById('calcOv').classList.add('open');
+  }
+  function closeCalcModal(){ document.getElementById('calcOv').classList.remove('open'); }
+
+  function renderCalcModal(){
+    var tipoOpts = CAMPOS_TIPOS.map(function(t){
+      return '<option value="' + t + '"' + (t === CALC_VALS.tipo ? ' selected' : '') + '>' + tipoLabel(t) + '</option>';
+    }).join('');
+    document.getElementById('calcBody').innerHTML =
+      '<div class="mfield"><label>Nombre interno (fijo)</label>' +
+        '<input id="calcClave" placeholder="ej. Semaforo FPD7" value="' + esc(CALC_VALS.clave) + '"' + (CALC_EDIT ? ' disabled' : '') + '></div>' +
+      '<div class="mfield"><label>Tipo</label><select id="calcTipo" onchange="calcTipoChange()">' + tipoOpts + '</select></div>' +
+      '<div id="calcSection"></div>' +
+      '<div class="mactions">' +
+        '<button class="btn sm grey" onclick="closeCalcModal()">Cancelar</button>' +
+        '<button class="btn sm" id="calcSaveBtn" onclick="saveCalcModal()">Guardar receta</button></div>';
+    renderCalcSection(CALC_VALS.tipo);
+  }
+  function calcTipoChange(){ CALC_VALS.tipo = document.getElementById('calcTipo').value; renderCalcSection(CALC_VALS.tipo); }
+
+  function renderCalcSection(tipo){
+    var el = document.getElementById('calcSection');
+    if (tipo === 'formula'){
+      el.innerHTML =
+        '<div class="mfield"><label>F\u00f3rmula</label>'
+        + '<input id="calcFormula" placeholder="ej. FFPD15_LAST4W / VFPD15_LAST4W   \u00f3   VENTA_TOTAL &gt; 0" value="'+esc(CALC_VALS.formula||'')+'" oninput="calcFormulaPreview()"></div>'
+        + '<div class="mfield"><label>Columnas detectadas</label><div id="calcFormulaPrev" class="calcprev"></div></div>'
+        + '<div class="chint">Usa columnas, n\u00fameros, + - * / ( ) y comparadores &gt; &gt;= &lt; &lt;= == != (una comparaci\u00f3n devuelve 1/0).</div>';
+      calcFormulaPreview(); return;
+    }
+    if (tipo === 'concatenado'){
+      el.innerHTML =
+        '<div class="mfield"><label>Separador</label><input id="calcSep" value="' + esc(CALC_VALS.sep) + '"></div>' +
+        '<div class="mfield"><label>Columnas a unir (orden = como se muestran)</label>' +
+          '<div id="calcConcatList"></div>' +
+          '<button class="btn sm grey" style="margin-top:8px" onclick="concatAdd()">+ Agregar columna</button></div>';
+      renderConcatList();
+    } else {
+      var uniOpts = CAMPOS_UNIDADES.map(function(u){
+        return '<option value="' + u + '"' + (u === CALC_VALS.unidad ? ' selected' : '') + '>' + (u === 'porcentaje' ? 'Porcentaje (%)' : 'N\u00famero') + '</option>';
+      }).join('');
+      el.innerHTML =
+        '<div class="mfield"><label>Columna origen (real o campo calculado)</label><select id="calcOrigen">' + origenOptionsCalc(CALC_VALS.origen) + '</select></div>' +
+        '<div class="mfield"><label>Unidad</label><select id="calcUnidad" onchange="calcPreview()">' + uniOpts + '</select></div>' +
+        '<div class="mrow2">' +
+          '<div class="mfield"><label>Corte verde &rarr; &aacute;mbar</label><input id="calcC1" type="number" step="any" value="' + esc(CALC_VALS.c1) + '" oninput="calcPreview()"></div>' +
+          '<div class="mfield"><label>Corte &aacute;mbar &rarr; rojo</label><input id="calcC2" type="number" step="any" value="' + esc(CALC_VALS.c2) + '" oninput="calcPreview()"></div>' +
+        '</div>' +
+        '<div class="mfield"><label>Vista previa</label><div id="calcPreview" class="calcprev"></div></div>';
+      calcPreview();
+    }
+  }
+
+  function renderConcatList(){
+    document.getElementById('calcConcatList').innerHTML = CALC_CONCAT.map(function(c, i){
+      return '<div class="ccrow">' +
+        '<select onchange="concatSet(' + i + ',this.value)">' + colOptionsCalc(c) + '</select>' +
+        '<button class="iconbtn" title="Subir" onclick="concatMove(' + i + ',-1)"' + (i === 0 ? ' disabled' : '') + '>&#8593;</button>' +
+        '<button class="iconbtn" title="Bajar" onclick="concatMove(' + i + ',1)"' + (i === CALC_CONCAT.length - 1 ? ' disabled' : '') + '>&#8595;</button>' +
+        '<button class="iconbtn del" title="Quitar" onclick="concatRemove(' + i + ')"' + (CALC_CONCAT.length <= 1 ? ' disabled' : '') + '>' + ICON_X + '</button>' +
+      '</div>';
+    }).join('');
+  }
+  function concatSet(i, val){ CALC_CONCAT[i] = val; }
+  function concatMove(i, d){ var j = i + d; if (j < 0 || j >= CALC_CONCAT.length) return; var t = CALC_CONCAT[i]; CALC_CONCAT[i] = CALC_CONCAT[j]; CALC_CONCAT[j] = t; renderConcatList(); }
+  function concatRemove(i){ if (CALC_CONCAT.length <= 1) return; CALC_CONCAT.splice(i, 1); renderConcatList(); }
+  function concatAdd(){ CALC_CONCAT.push(CAMPOS_COLS[0] || ''); renderConcatList(); }
+
+  function calcPreview(){
+    var el = document.getElementById('calcPreview'); if (!el) return;
+    var c1 = document.getElementById('calcC1').value, c2 = document.getElementById('calcC2').value;
+    var u = document.getElementById('calcUnidad').value, suf = (u === 'porcentaje') ? '%' : '';
+    var tipo = document.getElementById('calcTipo').value;
+    if (c1 === '' || c2 === '' || isNaN(Number(c1)) || isNaN(Number(c2))){ el.innerHTML = '<span class="fmuted">Completa los cortes para ver la vista previa.</span>'; return; }
+    if (Number(c1) >= Number(c2)){ el.innerHTML = '<span style="color:#c0392b;font-size:12px">El corte verde&rarr;&aacute;mbar debe ser menor que &aacute;mbar&rarr;rojo.</span>'; return; }
+    var cols = (tipo === 'semaforo_inv') ? ['bad','warn','ok'] : ['ok','warn','bad'];
+    var labels = ['< ' + c1 + suf, c1 + '\u2013' + c2 + suf, '> ' + c2 + suf];
+    el.innerHTML = labels.map(function(l, i){ return '<span class="chip">' + dot(cols[i]) + esc(l) + '</span>'; }).join('');
+  }
+
+  function saveCalcModal(){
+    var clave = CALC_EDIT ? CALC_VALS.clave : document.getElementById('calcClave').value.trim();
+    var tipo = document.getElementById('calcTipo').value;
+    if (!clave){ alert('Ingresa el nombre interno.'); return; }
+    var payload = { claveOriginal: CALC_EDIT || '', clave: clave, tipo: tipo };
+    if (tipo === 'formula'){
+      var fx = document.getElementById('calcFormula').value.trim();
+      if (!fx){ alert('Escribe la f\u00f3rmula.'); return; }
+      payload.formula = fx;
+    } else if (tipo === 'concatenado'){
+      var cols = CALC_CONCAT.filter(function(c){ return c; });
+      if (!cols.length){ alert('Elige al menos una columna.'); return; }
+      payload.columnas = cols; payload.separador = document.getElementById('calcSep').value;
+    } else {
+      var c1 = document.getElementById('calcC1').value, c2 = document.getElementById('calcC2').value;
+      if (c1 === '' || c2 === '' || isNaN(Number(c1)) || isNaN(Number(c2))){ alert('Completa los dos cortes con n\u00fameros.'); return; }
+      if (Number(c1) >= Number(c2)){ alert('El corte verde\u2192\u00e1mbar debe ser menor que \u00e1mbar\u2192rojo.'); return; }
+      payload.origen = document.getElementById('calcOrigen').value; payload.unidad = document.getElementById('calcUnidad').value;
+      payload.corte1 = Number(c1); payload.corte2 = Number(c2);
+    }
+    var btn = document.getElementById('calcSaveBtn'); if (btn){ btn.disabled = true; btn.textContent = 'Guardando\u2026'; }
+    LAST_DETAIL = null;
+    google.script.run.withSuccessHandler(function(d){ closeCalcModal(); renderCamposManager(d); })
+      .withFailureHandler(function(err){ var b=document.getElementById('calcSaveBtn'); if(b){b.disabled=false;b.textContent='Guardar receta';} alert((err&&err.message)?err.message:'Error al guardar la receta.'); })
+      .saveCalculado(payload);
+  }
+
+  function deleteCalc(clave){
+    if (!confirm('\u00bfBorrar la receta "' + clave + '"?\n\nLa fila quedar\u00e1 hu\u00e9rfana en el gestor para que la quites cuando quieras.')) return;
+    LAST_DETAIL = null;
+    google.script.run.withSuccessHandler(function(d){ renderCamposManager(d); })
+      .withFailureHandler(function(err){ alert((err && err.message) ? err.message : 'Error al borrar.'); })
+      .deleteCalculado(clave);
+  }
+</script>
+
+<style>
+  .rsm-view{
+    --rsm-ok:#2e9e5b; --rsm-ok-bg:#e7f4ec;
+    --rsm-warn:#e0a100; --rsm-warn-bg:#fbf2d9;
+    --rsm-crit:#d64545; --rsm-crit-bg:#fbe6e6;
+    --rsm-line:#e6e6e6; --rsm-muted:#8a8f98; --rsm-sec:#5b6069;
+    --rsm-track:#eef0f2;
+    display:flex; flex-direction:column; gap:13px;
+    padding:14px; max-width:520px; margin:0 auto;
+    font-family:inherit; color:#20242b;
+  }
+  .rsm-loading{color:var(--rsm-muted);font-size:13px;padding:20px;text-align:center;}
+  .rsm-head{display:flex;align-items:center;justify-content:space-between;}
+  .rsm-title{font-size:16px;font-weight:600;}
+
+  .rsm-pill-wrap{position:relative;}
+  .rsm-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;
+    padding:4px 10px;border-radius:999px;cursor:pointer;border:none;
+    background:var(--rsm-ok-bg);color:var(--rsm-ok);}
+  .rsm-pill.stale{background:var(--rsm-warn-bg);color:var(--rsm-warn);}
+  .rsm-pop{position:absolute;right:0;top:calc(100% + 6px);z-index:20;
+    background:#fff;border:1px solid var(--rsm-line);border-radius:12px;
+    padding:10px 12px;width:210px;box-shadow:0 6px 20px rgba(0,0,0,.08);display:none;}
+  .rsm-pill-wrap.open .rsm-pop{display:block;}
+  @media (hover:hover){ .rsm-pill-wrap:hover .rsm-pop{display:block;} }
+  .rsm-pop-row{display:flex;justify-content:space-between;font-size:11px;margin:3px 0;}
+  .rsm-pop-row span:first-child{color:var(--rsm-sec);}
+  .rsm-pop-row span:last-child{font-weight:600;}
+
+  .rsm-tiles{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
+  .rsm-tile{background:#fff;border:1px solid var(--rsm-line);border-radius:12px;padding:12px;}
+  .rsm-tile.nd{opacity:.7;}
+  .rsm-tile-lbl{font-size:11px;color:var(--rsm-sec);}
+  .rsm-tile-row{display:flex;align-items:baseline;justify-content:space-between;margin:2px 0 4px;}
+  .rsm-tile-val{font-size:22px;font-weight:600;}
+  .rsm-tile-badge{font-size:12px;font-weight:600;}
+  .rsm-bar{position:relative;height:7px;background:var(--rsm-track);border-radius:999px;overflow:hidden;}
+  .rsm-bar>i{display:block;height:100%;border-radius:999px;}
+  .rsm-tick{position:absolute;top:-2px;width:2px;height:11px;background:#20242b;}
+  .rsm-cap{font-size:11px;color:var(--rsm-muted);margin-top:5px;}
+
+  .rsm-card{background:#fff;border:1px solid var(--rsm-line);border-radius:12px;padding:12px;}
+  .rsm-card-t{font-size:13px;font-weight:600;margin-bottom:8px;}
+  .rsm-note{font-size:11px;color:var(--rsm-muted);margin-top:9px;border-top:1px solid var(--rsm-line);padding-top:8px;}
+
+  .rsm-tab{width:100%;table-layout:fixed;border-collapse:collapse;}
+  .rsm-tab th{font-size:11px;color:var(--rsm-muted);font-weight:400;text-align:center;padding-bottom:6px;}
+  .rsm-tab th.l,.rsm-tab td.l{text-align:left;}
+  .rsm-tab td{font-size:12px;padding:8px 0;border-top:1px solid var(--rsm-line);text-align:center;}
+  .rsm-tab td.l{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .rsm-strong{font-weight:600;}
+
+  .rsm-crit-row{display:flex;align-items:center;gap:8px;border-top:1px solid var(--rsm-line);padding:8px 0;}
+  .rsm-crit-row:first-child{border-top:none;}
+  .rsm-crit-main{flex:1;min-width:0;}
+  .rsm-crit-name{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .rsm-crit-sub{font-size:11px;color:var(--rsm-muted);}
+  .rsm-dot{width:9px;height:9px;border-radius:50%;flex:none;}
+  .rsm-dif{font-size:12px;font-weight:600;width:30px;text-align:right;}
+
+  .rsm-c-ok{color:var(--rsm-ok);}   .rsm-bg-ok{background:var(--rsm-ok);}
+  .rsm-c-warn{color:var(--rsm-warn);} .rsm-bg-warn{background:var(--rsm-warn);}
+  .rsm-c-crit{color:var(--rsm-crit);} .rsm-bg-crit{background:var(--rsm-crit);}
+  .rsm-c-nd{color:var(--rsm-muted);}  .rsm-bg-nd{background:#c7ccd2;}
+</style>
+
+<script>
+/* El Resumen se pinta desde el paquete ya cargado (BOOT). No vuelve al servidor
+   al navegar entre modulos; solo bootstrap() (inicio / "Ver como" / "Salir") relee. */
+function cargarResumen(){
+  var el = document.getElementById('rsmView');
+  if (BOOT && BOOT.resumen){ rsmRender(BOOT.resumen); return; }
+  el.innerHTML = '<div class="rsm-loading">Cargando resumen&hellip;</div>';
+  bootstrap((window.STATE && STATE.viewAs) ? STATE.viewAs : null, 'resumen');
+}
+
+function rsmRender(d){
+  var el = document.getElementById('rsmView');
+  if (applyGate(d.rol) || !d.kpis) return;      // gate server-side: si no hay acceso, no pinta nada
+  var k = d.kpis;
+  // Pinta el chip/rol apenas responde el Resumen (no espera a getStores).
+  if (d.email){
+    var chip = document.getElementById('userChip');
+    if (chip && chip.innerHTML.indexOf('@') < 0) chip.innerHTML = d.email + ' <span class="caret">&#9660;</span>';
+    var rb = document.getElementById('roleBadge');
+    if (rb && !rb.textContent) rb.textContent = (d.rol === 'ejecutivo' ? 'usuario' : d.rol);
+    if (window.STATE && (!STATE.role || STATE.role === 'usuario')) STATE.role = (d.rol === 'ejecutivo' ? 'usuario' : d.rol);
+  }
+  var esSup = (d.rol==='supervisor' || d.rol==='maestro' || d.rol==='admin');
+  var html = '';
+
+  html += '<div class="rsm-head"><span class="rsm-title">Resumen</span>';
+  html += '<div class="rsm-pill-wrap" id="rsmPillWrap">';
+  html += '<button type="button" class="rsm-pill'+(d.meta&&d.meta.stale?' stale':'')+'" onclick="rsmTogglePill()">'
+        + '&#x21bb; '+((d.meta&&d.meta.reporteCorto)||'—')+' &#9662;</button>';
+  html += '<div class="rsm-pop">'
+        + '<div class="rsm-pop-row"><span>Reporte actualizado</span><span>'+((d.meta&&d.meta.reporteLargo)||'—')+'</span></div>'
+        + '<div class="rsm-pop-row"><span>Última evaluación</span><span>'+((d.meta&&d.meta.evalLargo)||'—')+'</span></div>'
+        + '</div></div></div>';
+
+  html += '<div class="rsm-tiles">';
+  html += rsmTile('Ventas', rsmNum(k.ventas.valor), rsmPct(k.ventas.proyPct), k.ventas.estado, k.ventas.barra, k.ventas.tick, rsmNum(k.ventas.proy), rsmNum(k.ventas.cuota));
+  html += rsmTile('Activas', String(k.activas.valor), rsmPct(k.activas.pct), k.activas.estado, k.activas.barra, k.activas.tick, String(k.activas.valor), rsmNum(k.activas.cuota));
+  html += rsmTile('FPD15', rsmFpd(k.fpd.valor), rsmPct(k.fpd.cumpl), k.fpd.estado, k.fpd.barra, k.fpd.tick, rsmPct2(k.fpd.valor), rsmPct2(k.fpd.cuota));
+  html += rsmTile('Venta Conjunta', rsmPct(k.vc.ratio), rsmPct(k.vc.cumpl), k.vc.estado, k.vc.barra, k.vc.tick, rsmPct(k.vc.ratio), rsmPct(k.vc.meta));
+  html += '</div>';
+
+  if(esSup && d.seguimiento && d.seguimiento.length){
+    html += '<div class="rsm-card"><div class="rsm-card-t">Seguimiento por ejecutivo</div>';
+    html += '<table class="rsm-tab"><thead><tr><th class="l">Ejecutivo</th><th>Vta</th><th>Act</th><th>FPD</th><th>VC</th></tr></thead><tbody>';
+    d.seguimiento.forEach(function(s){
+      html += '<tr>'
+        + '<td class="l">'+rsmCorto(s.ejecutivo)+'</td>'
+        + rsmCell(rsmPct(s.ventasProyPct), rsmEstCump(s.ventasProyPct))
+        + rsmCell(rsmPct(s.activasPct), rsmEstCump(s.activasPct))
+        + rsmCell(rsmFpd(s.fpd), rsmEstCump(s.fpdCumpl))
+        + rsmCell(rsmPct(s.vc), rsmEstCump(s.vc==null?null:s.vc/0.60))
+        + '</tr>';
+    });
+    html += '</tbody></table>';
+    html += '<div class="rsm-note">Vta = proyección vs cuota · FPD = cumplimiento vs cuota · VC = ratio de activación vs meta 60%</div></div>';
+  }
+
+  html += '<div class="rsm-card"><div class="rsm-card-t">Tiendas críticas</div>';
+  if(!d.criticas.length){ html += '<div class="rsm-cap">Sin tiendas en alerta.</div>'; }
+  else {
+    d.criticas.forEach(function(t){
+      html += '<div class="rsm-crit-row"><div class="rsm-crit-main">'
+        + '<div class="rsm-crit-name">'+t.id+' - '+t.nombre+'</div>'
+        + (esSup && t.ejecutivo ? '<div class="rsm-crit-sub">Ejec. '+rsmCorto(t.ejecutivo)+'</div>' : '')
+        + '</div>'
+        + '<span class="rsm-dif '+rsmC(t.difEstado)+'">'+(t.dif==null?'—':t.dif)+'</span>'
+        + '<span class="rsm-dot '+rsmBg(t.fpd7Estado)+'" title="FPD7"></span>'
+        + '<span class="rsm-dot '+rsmBg(t.fpd15Estado)+'" title="FPD15"></span>'
+        + '</div>';
+    });
+  }
+  html += '</div>';
+  el.innerHTML = html;
+  hideBoot();  
+}
+
+// Tile unificado: número grande · insignia de cumplimiento % · barra con tick al 100% · leyenda "real de cuota".
+function rsmTile(lbl, big, badge, estado, barra, tick, capReal, capCuota){
+  return '<div class="rsm-tile'+(estado==='nd'?' nd':'')+'">'
+    + '<div class="rsm-tile-lbl">'+lbl+'</div>'
+    + '<div class="rsm-tile-row"><span class="rsm-tile-val">'+big+'</span>'
+    + '<span class="rsm-tile-badge '+rsmC(estado)+'">'+badge+'</span></div>'
+    + rsmBar(barra, estado, tick)
+    + '<div class="rsm-cap">'+capReal+' de '+capCuota+'</div></div>';
+}
+function rsmPct2(x){ return x==null ? '—' : (x*100).toFixed(2)+'%'; }
+
+// Gate de acceso: bloquea TODO (sin datos, sin módulos, sin nav).
+function rsmBlocked(role){ return ['baja','sin_acceso','solicitar'].indexOf(String(role||'').toLowerCase()) > -1; }
+function applyGate(role){
+  if (!rsmBlocked(role)) return false;
+  var hide = function(sel){ var e=document.querySelector(sel); if(e) e.style.display='none'; };
+  hide('.hamb'); hide('.chipwrap');
+  var badge=document.getElementById('roleBadge'); if(badge) badge.style.display='none';
+  var vb=document.getElementById('viewBanner'); if(vb) vb.style.display='none';
+  ['storeView','usersView','camposView','visitasView','rsmView'].forEach(function(id){ var e=document.getElementById(id); if(e) e.style.display='none'; });
+  var msg = (String(role).toLowerCase()==='solicitar')
+    ? 'No tienes acceso todav\u00eda. Escr\u00edbele a Alfredo Cortez (alfredo.cortez@payjoy.com) por Slack para que te habilite el ingreso.'
+    : 'No tienes acceso a esta aplicaci\u00f3n.';
+  var g=document.getElementById('accessGate');
+  if(!g){ g=document.createElement('div'); g.id='accessGate'; var w=document.querySelector('.wrap'); w.parentNode.insertBefore(g, w); }
+  g.style.cssText='max-width:520px;margin:60px auto;padding:28px;text-align:center;color:var(--muted);font-size:15px;line-height:1.6';
+  g.innerHTML='<div style="font-size:40px;margin-bottom:12px">&#128274;</div>'
+    + '<div style="color:var(--ink);font-weight:600;font-size:17px;margin-bottom:8px">Acceso restringido</div><div>'+msg+'</div>';
+  hideBoot();  
+  return true;
+}
+function rsmBar(p, estado, tick){
+  var t = tick>0 ? '<span class="rsm-tick" style="left:'+Math.round(tick*100)+'%"></span>' : '';
+  return '<div class="rsm-bar"><i class="'+rsmBg(estado)+'" style="width:'+Math.round(p*100)+'%"></i>'+t+'</div>';
+}
+function rsmCell(txt, estado){ return '<td class="rsm-strong '+rsmC(estado)+'">'+txt+'</td>'; }
+function rsmTogglePill(){ document.getElementById('rsmPillWrap').classList.toggle('open'); }
+function rsmNum(n){ return (n==null?0:n).toLocaleString('es-PE'); }
+function rsmPct(x){ return x==null ? '—' : Math.round(x*100)+'%'; }
+function rsmFpd(x){ return x==null ? 'N/D' : (x*100).toFixed(2)+'%'; }
+function rsmCorto(email){ if(!email) return '—'; var p=email.split('@')[0].split('.');
+  return p.length>1 ? (p[0].charAt(0)+'. '+p[1].charAt(0).toUpperCase()+p[1].slice(1)) : p[0]; }
+function rsmC(e){ return e==='ok'?'rsm-c-ok':e==='warn'?'rsm-c-warn':e==='crit'?'rsm-c-crit':'rsm-c-nd'; }
+function rsmBg(e){ return e==='ok'?'rsm-bg-ok':e==='warn'?'rsm-bg-warn':e==='crit'?'rsm-bg-crit':'rsm-bg-nd'; }
+function rsmEstCump(p){ if(p==null)return'nd'; if(p>=1)return'ok'; if(p>=0.9)return'warn'; return'crit'; }
+function rsmEstFpd(f){ if(f==null)return'nd'; if(f<=0.06)return'ok'; if(f<=0.079)return'warn'; return'crit'; }
+function rsmEtiqFpd(e){ return e==='ok'?'sano':e==='warn'?'alerta':e==='crit'?'crítico':'N/D'; }
+
+/* ---------- enganche con la navegación existente ---------- */
+function showResumen(){
+  var ids=['storeView','usersView','camposView','visitasView'];
+  ids.forEach(function(id){ var e=document.getElementById(id); if(e) e.style.display='none'; });
+  var rv=document.getElementById('rsmView'); if(rv) rv.style.display='';
+  if(typeof updateNavActive==='function') updateNavActive('resumen');
+  cargarResumen();
+}
+/* Al mostrar otra vista, oculta el Resumen (sin editar tus funciones). */
+['showStores','showVisitas','showUsers','showCampos'].forEach(function(fn){
+  var orig=window[fn];
+  if(typeof orig==='function'){
+    window[fn]=function(){ var rv=document.getElementById('rsmView'); if(rv) rv.style.display='none'; return orig.apply(this,arguments); };
+  }
+});
+/* navGo('resumen') + marcar activo el ítem de nav. */
+(function(){
+  var oNav=window.navGo;
+  window.navGo=function(mod){
+    if(mod==='resumen'){
+      if(typeof camposGuard==='function' && !camposGuard()) return;
+      if(typeof closeNav==='function') closeNav();
+      showResumen(); return;
+    }
+    return (typeof oNav==='function') ? oNav.apply(this,arguments) : undefined;
+  };
+  var oAct=window.updateNavActive;
+  window.updateNavActive=function(mod){
+    if(typeof oAct==='function') oAct(mod);
+    var n=document.getElementById('navResumen'); if(n) n.classList.toggle('active', mod==='resumen');
+  };
+})();
+
+/* ===== Carga unificada: UNA sola lectura del servidor arma Resumen + Tiendas ===== */
+var BOOT = null;   // { stores, resumen } del ultimo bootstrap
+
+function bootstrap(viewAs, landView){
+  STATE.viewAs = viewAs || null;
+  landView = landView || 'resumen';
+  if (landView === 'tiendas'){
+    showStores();
+    var g = document.getElementById('grid'); if (g) g.innerHTML = LOADING_HTML;
+  } else {
+    var rv = document.getElementById('rsmView');
+    if (rv){ rv.style.display = ''; rv.innerHTML = '<div class="rsm-loading">Cargando resumen&hellip;</div>'; }
+  }
+  google.script.run
+    .withSuccessHandler(function(res){ onBootstrap(res, landView); })
+    .withFailureHandler(onBootError)
+    .getBootstrap(viewAs || null);
+}
+
+function onBootstrap(res, landView){
+  BOOT = res;
+  if (applyGate(res.stores.role)) return;    // bloqueado -> pantalla de acceso
+  onData(res.stores);                         // pobla STATE + pinta grid (sin cambiar de vista)
+  if (landView === 'tiendas') showStores();   // Tiendas ya renderizado
+  else showResumen();                         // Resumen se pinta desde BOOT (instantaneo)
+  hideBoot();
+}
+
+function onBootError(err){
+  var rv = document.getElementById('rsmView');
+  if (rv && rv.style.display !== 'none') rv.innerHTML = '<div class="rsm-loading">No se pudo cargar. Reintenta.</div>';
+  var g = document.getElementById('grid');
+  if (g && !g.innerHTML) g.innerHTML = '<div class="empty">No se pudo cargar la data.<br>' + (err && err.message ? err.message : '') + '</div>';
+  hideBoot();
+}
+
+if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura arma todo y aterriza en Resumen
+</script>
+<script>
+/* =====================================================================
+ * ADAPTADOR POR MÓDULO (una página de Creator por módulo)
+ * Solo actúa si la página fijó window.VC_MODULO = 'resumen' | 'tiendas' | 'visitas'.
+ *  - Oculta el menú de módulos propio (la navegación la hace Creator).
+ *  - Arranca y se queda en el módulo de la página (también tras "Ver como" / "Salir").
+ *  - "Ver como" se conserva al pasar de una página a otra (sessionStorage).
+ * ===================================================================== */
+(function(){
+  var MOD = window.VC_MODULO;
+  if (!MOD) return;
+
+  var css = document.createElement('style');
+  css.textContent = '.hamb,#navPanel,#navOverlay{display:none!important}';
+  document.head.appendChild(css);
+
+  var CLAVE = 'vc_viewAs';
+  function leerVA(){ try { return sessionStorage.getItem(CLAVE) || null; } catch(e){ return null; } }
+  function guardarVA(v){ try { if (v) sessionStorage.setItem(CLAVE, v); else sessionStorage.removeItem(CLAVE); } catch(e){} }
+
+  var bootOriginal = window.bootstrap;
+
+  if (MOD === 'visitas'){
+    // Visitas: valida acceso y rol con el bootstrap liviano (sin tiendas) y pinta la agenda.
+    window.bootstrap = function(viewAs){
+      viewAs = viewAs || null;
+      guardarVA(viewAs);
+      STATE.viewAs = viewAs;
+      var vv = document.getElementById('visitasView');
+      if (vv){ vv.style.display = ''; vv.innerHTML = LOADING_HTML; }
+      google.script.run
+        .withSuccessHandler(function(res){
+          window.BOOT = res;
+          if (applyGate(res.stores.role)) return;
+          onData(res.stores);
+          showVisitas();
+          hideBoot();
+        })
+        .withFailureHandler(function(err){
+          if (vv){ vv.style.display = ''; vv.innerHTML = '<div class="empty">No se pudo cargar.<br>' + (err && err.message ? err.message : '') + '</div>'; }
+          hideBoot();
+        })
+        .getBootstrap(viewAs);
+    };
+  } else {
+    // Resumen / Tiendas: mismo bootstrap original, pero siempre aterriza en el módulo de la página.
+    window.bootstrap = function(viewAs){
+      guardarVA(viewAs || null);
+      return bootOriginal(viewAs || null, MOD);
+    };
+  }
+
+  window.bootstrap(leerVA());
+})();
+
+</script>
+</body>
+</html>
