@@ -1682,6 +1682,7 @@ function resumenSesion_() {
 
   /* ---------- Tiendas: carga diferida + caché del día en el navegador ---------- */
   var MODULO = window.VC_MODULO || '';
+  var LIVIANOS = { visitas: 1, usuarios: 1, campos: 1 };   // páginas que no necesitan las filas de tiendas al abrir
   var BLOQUES = 0, TIENDAS_PROMESA = null;
   function idb(){
     return new Promise(function(ok){
@@ -1743,6 +1744,7 @@ function resumenSesion_() {
     var t0 = Date.now(), Z = await esperarSdk();
     var ip = await Z.UTIL.getInitParams();
     C.SESION.email = String((ip && ip.loginUser) || '').trim().toLowerCase();
+    window.VC_INIT = ip || {};
     DIAG.usuario = C.SESION.email;
 
     var nombres = Object.keys(FORMS);
@@ -1773,7 +1775,7 @@ function resumenSesion_() {
       leerTodo(FORMS.CONFIG_CAMPOS.report, 'ID != 0'),
       leerTodo(FORMS.CONFIG_CALCULADOS.report, 'ID != 0'),
       leerTodo(FORMS.Visitas.report, critSnap),
-      (MODULO === 'visitas') ? Promise.resolve(null) : asegurarTiendas()
+      LIVIANOS[MODULO] ? Promise.resolve(null) : asegurarTiendas()
     ]);
     armarHoja('USUARIOS', res[0]);
     armarHoja('CONFIG_CAMPOS', res[1]);
@@ -1852,7 +1854,7 @@ function resumenSesion_() {
         await LISTO;
         var fn = VC_SERVER[nombre];
         if (typeof fn !== 'function') throw new Error('Función no disponible en el widget: ' + nombre);
-        if (NECESITAN_TIENDAS[nombre] || (nombre === 'getBootstrap' && MODULO !== 'visitas')) await asegurarTiendas();
+        if (NECESITAN_TIENDAS[nombre] || (nombre === 'getBootstrap' && !LIVIANOS[MODULO])) await asegurarTiendas();
         if (nombre === 'getStoreDetail') await asegurarClerks(args[0]);
         copia = copiaEscribibles();
         var res = fn.apply(null, args);
@@ -3280,54 +3282,167 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
 </script>
 <script>
 /* =====================================================================
- * ADAPTADOR POR MÓDULO (una página de Creator por módulo)
- * Solo actúa si la página fijó window.VC_MODULO = 'resumen' | 'tiendas' | 'visitas'.
- *  - Oculta el menú de módulos propio (la navegación la hace Creator).
- *  - Arranca y se queda en el módulo de la página (también tras "Ver como" / "Salir").
- *  - "Ver como" se conserva al pasar de una página a otra (sessionStorage).
+ * ADAPTADOR
+ * 1) Protección de cambios sin guardar en Campos (aplica en todas las versiones):
+ *    barra fija de aviso, borrador automático en el navegador y aviso al cerrar.
+ * 2) Páginas por módulo: si la página fijó window.VC_MODULO =
+ *    'resumen' | 'tiendas' | 'visitas' | 'usuarios' | 'campos'
+ *    - Oculta el menú de módulos, el menú del correo y los botones "Volver".
+ *    - Arranca y se queda en el módulo de la página.
+ *    - "Ver como" se conserva entre páginas; desde Usuarios abre la página Resumen.
  * ===================================================================== */
+
+/* ---------- 1) Campos: protección de cambios sin guardar ---------- */
+(function(){
+  if (typeof window.renderCamposManager !== 'function' || typeof window.refreshSaveBtn !== 'function') return;
+  var KEY = 'vc_campos_borrador';
+  function leer(){ try { return JSON.parse(localStorage.getItem(KEY) || 'null'); } catch(e){ return null; } }
+  function guardar(b){ try { localStorage.setItem(KEY, JSON.stringify(b)); } catch(e){} }
+  function borrar(){ try { localStorage.removeItem(KEY); } catch(e){} }
+  function proyeccion(estado){
+    return JSON.stringify((estado || []).map(function(it){
+      return { columna: it.columna, etiqueta: it.etiqueta, enDetalle: !!it.enDetalle, formato: it.formato, protegida: !!it.protegida };
+    }));
+  }
+  function enCampos(){ var cv = document.getElementById('camposView'); return !!(cv && cv.style.display !== 'none' && document.getElementById('fieldList')); }
+  function sucio(){ return enCampos() && CAMPOS_STATE.length && JSON.stringify(camposProjection()) !== CAMPOS_SNAP; }
+
+  var css = document.createElement('style');
+  css.textContent =
+    '#vcPendiente{position:fixed;left:0;right:0;bottom:0;z-index:900;display:none;align-items:center;gap:12px;' +
+      'padding:12px 16px;background:#fff4d6;border-top:2px solid #e0a800;font-size:14px;color:#5c4400;box-shadow:0 -2px 8px rgba(0,0,0,.08)}' +
+    '#vcPendiente b{flex:1}#vcPendiente button{border:0;border-radius:8px;padding:8px 14px;font-weight:600;cursor:pointer;background:#1f7c2e;color:#fff}' +
+    '#vcBorrador{margin:0 0 12px;padding:12px 14px;border-radius:10px;background:#eef6ff;border:1px solid #9cc3ef;color:#123a63;font-size:14px}' +
+    '#vcBorrador .acc{margin-top:8px;display:flex;gap:8px;flex-wrap:wrap}#vcBorrador button{border:0;border-radius:8px;padding:7px 12px;cursor:pointer;font-weight:600}' +
+    '#vcBorrador .rec{background:#1f7c2e;color:#fff}#vcBorrador .des{background:#e6e9e6;color:#1a1f1a}#vcBorrador .ojo{margin-top:6px;color:#8a4b00}' +
+    'body.vc-pend{padding-bottom:64px}';
+  document.head.appendChild(css);
+  var barra = document.createElement('div');
+  barra.id = 'vcPendiente';
+  barra.innerHTML = '<b>Tienes cambios sin guardar en Campos</b><button type="button">Guardar</button>';
+  barra.querySelector('button').onclick = function(){ if (typeof saveCampos === 'function') saveCampos(); };
+  document.body.appendChild(barra);
+
+  function actualizar(){
+    var s = sucio();
+    barra.style.display = s ? 'flex' : 'none';
+    document.body.classList.toggle('vc-pend', !!s);
+    if (!enCampos()) return;
+    if (s) guardar({ base: CAMPOS_SNAP, estado: CAMPOS_STATE, guardado: Date.now() });
+    else borrar();
+  }
+
+  var refrescarOriginal = window.refreshSaveBtn;
+  window.refreshSaveBtn = function(){ var r = refrescarOriginal.apply(this, arguments); actualizar(); return r; };
+
+  var renderOriginal = window.renderCamposManager;
+  window.renderCamposManager = function(d){
+    var r = renderOriginal.apply(this, arguments);
+    var b = leer();
+    if (b && b.estado && proyeccion(b.estado) !== CAMPOS_SNAP) ofrecerBorrador(b);
+    else borrar();
+    actualizar();
+    return r;
+  };
+
+  function ofrecerBorrador(b){
+    var cv = document.getElementById('camposView'); if (!cv) return;
+    var fecha = '';
+    try { fecha = new Date(b.guardado).toLocaleString('es-PE', { dateStyle: 'short', timeStyle: 'short' }); } catch(e){}
+    var cambio = (b.base !== CAMPOS_SNAP);
+    var aviso = document.createElement('div');
+    aviso.id = 'vcBorrador';
+    aviso.innerHTML = '<div><b>Tienes cambios sin guardar</b> de la vez anterior' + (fecha ? ' (' + fecha + ')' : '') + '.</div>' +
+      (cambio ? '<div class="ojo">&#9888; La configuración guardada cambió desde entonces. Si recuperas y guardas, tu borrador reemplazará esa versión.</div>' : '') +
+      '<div class="acc"><button type="button" class="rec">Recuperar cambios</button><button type="button" class="des">Descartar</button></div>';
+    cv.insertBefore(aviso, cv.firstChild);
+    aviso.querySelector('.rec').onclick = function(){
+      CAMPOS_STATE = b.estado;
+      aviso.remove();
+      renderCamposRows();
+      refreshSaveBtn();
+    };
+    aviso.querySelector('.des').onclick = function(){ borrar(); aviso.remove(); actualizar(); };
+  }
+
+  // Al salir de Campos por la propia app (Volver, otro módulo), la barra se esconde sola.
+  ['showStores', 'showVisitas', 'showUsers', 'showResumen'].forEach(function(fn){
+    var o = window[fn]; if (typeof o !== 'function') return;
+    window[fn] = function(){ var r = o.apply(this, arguments); actualizar(); return r; };
+  });
+
+  // Refuerzo: aviso del navegador al cerrar o recargar con cambios pendientes.
+  window.addEventListener('beforeunload', function(e){ if (sucio()){ e.preventDefault(); e.returnValue = ''; return ''; } });
+})();
+
+/* ---------- 2) Páginas por módulo ---------- */
 (function(){
   var MOD = window.VC_MODULO;
   if (!MOD) return;
+  // Nombres internos de las páginas en Creator (para el salto de "Ver como").
+  var PAGINAS = { resumen: 'Resumen', tiendas: 'Tiendas', visitas: 'Visitas', usuarios: 'Usuarios', campos: 'Campos' };
 
   var css = document.createElement('style');
-  css.textContent = '.hamb,#navPanel,#navOverlay{display:none!important}';
+  css.textContent = '.hamb,#navPanel,#navOverlay,#userMenu,#userChip .caret,[onclick="volverModulo()"]{display:none!important}' +
+                    '#userChip{cursor:default!important}';
   document.head.appendChild(css);
+  window.toggleMenu = function(ev){ if (ev) ev.stopPropagation(); };
 
   var CLAVE = 'vc_viewAs';
   function leerVA(){ try { return sessionStorage.getItem(CLAVE) || null; } catch(e){ return null; } }
   function guardarVA(v){ try { if (v) sessionStorage.setItem(CLAVE, v); else sessionStorage.removeItem(CLAVE); } catch(e){} }
 
-  var bootOriginal = window.bootstrap;
+  function irAPagina(mod){
+    var ip = window.VC_INIT || {};
+    var url = 'https://creatorapp.zoho.com/' + (ip.scope || 'payjoy_ec') + '/' + (ip.appLinkName || 'app-de-campo') +
+              (ip.envUrlFragment || '') + '/#Page:' + PAGINAS[mod];
+    try {
+      ZOHO.CREATOR.UTIL.navigateParentURL({ action: 'open', url: url, window: 'same' });
+    } catch(e){
+      alert('Vista activada. Abre "' + PAGINAS[mod] + '" desde el menú de la app.');
+    }
+  }
 
-  if (MOD === 'visitas'){
-    // Visitas: valida acceso y rol con el bootstrap liviano (sin tiendas) y pinta la agenda.
+  function mensaje(el, html){ if (el){ el.style.display = ''; el.innerHTML = '<div class="empty">' + html + '</div>'; } }
+
+  var bootOriginal = window.bootstrap;
+  if (MOD === 'resumen' || MOD === 'tiendas'){
+    // Mismo bootstrap original, pero siempre aterriza en el módulo de la página.
+    window.bootstrap = function(viewAs){ guardarVA(viewAs || null); return bootOriginal(viewAs || null, MOD); };
+  } else {
+    // Visitas / Usuarios / Campos: bootstrap liviano (sin tiendas) para validar acceso y rol, y luego su pantalla.
+    var vista = { visitas: 'visitasView', usuarios: 'usersView', campos: 'camposView' }[MOD];
     window.bootstrap = function(viewAs){
       viewAs = viewAs || null;
       guardarVA(viewAs);
       STATE.viewAs = viewAs;
-      var vv = document.getElementById('visitasView');
-      if (vv){ vv.style.display = ''; vv.innerHTML = LOADING_HTML; }
+      var el = document.getElementById(vista);
+      if (el){ el.style.display = ''; el.innerHTML = LOADING_HTML; }
       google.script.run
         .withSuccessHandler(function(res){
           window.BOOT = res;
           if (applyGate(res.stores.role)) return;
           onData(res.stores);
-          showVisitas();
+          var sv = document.getElementById('storeView'); if (sv) sv.style.display = 'none';
+          var rv = document.getElementById('rsmView'); if (rv) rv.style.display = 'none';
+          if (MOD === 'visitas') showVisitas();
+          else if (MOD === 'usuarios'){
+            if (STATE.role === 'maestro' || STATE.role === 'supervisor') showUsers();
+            else mensaje(el, 'Esta página es para maestros y supervisores.');
+          } else {
+            if (STATE.role === 'maestro') showCampos();
+            else mensaje(el, 'Esta página es solo para el rol maestro.');
+          }
           hideBoot();
         })
-        .withFailureHandler(function(err){
-          if (vv){ vv.style.display = ''; vv.innerHTML = '<div class="empty">No se pudo cargar.<br>' + (err && err.message ? err.message : '') + '</div>'; }
-          hideBoot();
-        })
+        .withFailureHandler(function(err){ mensaje(el, 'No se pudo cargar.<br>' + (err && err.message ? err.message : '')); hideBoot(); })
         .getBootstrap(viewAs);
     };
-  } else {
-    // Resumen / Tiendas: mismo bootstrap original, pero siempre aterriza en el módulo de la página.
-    window.bootstrap = function(viewAs){
-      guardarVA(viewAs || null);
-      return bootOriginal(viewAs || null, MOD);
-    };
+  }
+
+  if (MOD === 'usuarios'){
+    // Desde Usuarios, "Ver como" guarda la vista elegida y abre la página Resumen.
+    window.verComo = function(email){ if (!email) return; guardarVA(String(email).trim().toLowerCase()); irAPagina('resumen'); };
   }
 
   window.bootstrap(leerVA());
