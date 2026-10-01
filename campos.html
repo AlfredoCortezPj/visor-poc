@@ -1839,7 +1839,15 @@ function resumenSesion_() {
       var crit = viejos.slice(j, j + 50).map(function(id){ return 'ID == ' + id; }).join(' || ');
       DIAG.llamadas++;
       try { await sdk().DATA.deleteRecords({ report_name: def.report, criteria: crit }); }
-      catch(e){ if (codigoDe(e) !== 9220) throw errorLegible(e, 'limpiando ' + def.form); }
+      catch(e){
+        if (codigoDe(e) === 9220) continue;
+        // No se pudo borrar la versión anterior: se deshace el alta para no dejar registros duplicados.
+        for (var k = 0; k < nuevos.length; k += 50){
+          try { await sdk().DATA.deleteRecords({ report_name: def.report,
+                  criteria: nuevos.slice(k, k + 50).map(function(id){ return 'ID == ' + id; }).join(' || ') }); } catch(_){}
+        }
+        throw errorLegible(e, 'limpiando ' + def.form);
+      }
     }
     IDS[nombre] = nuevos;
     h.sucia = false;
@@ -1860,6 +1868,7 @@ function resumenSesion_() {
         var res = fn.apply(null, args);
         var sucias = Object.keys(FORMS).filter(function(n){ return FORMS[n].escribible && C.LIBRO.hojas[n] && C.LIBRO.hojas[n].sucia; });
         for (var i = 0; i < sucias.length; i++) await persistir(sucias[i]);
+        if (sucias.length) setTimeout(function(){ if (window.vcAviso) vcAviso('Cambios guardados en Creator', 'ok'); }, 0);
         var out = (res === undefined) ? null : JSON.parse(JSON.stringify(res));
         setTimeout(function(){ if (ok) ok(out, usuario); }, 0);
       } catch(e){
@@ -3291,6 +3300,54 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
  *    - Arranca y se queda en el módulo de la página.
  *    - "Ver como" se conserva entre páginas; desde Usuarios abre la página Resumen.
  * ===================================================================== */
+
+/* ---------- 0) Avisos visibles: errores y confirmaciones de guardado ---------- */
+(function(){
+  var css = document.createElement('style');
+  css.textContent =
+    '#vcToast{position:fixed;left:50%;top:14px;transform:translateX(-50%);z-index:1000;max-width:min(92vw,560px);display:none;' +
+      'padding:12px 16px;border-radius:10px;font-size:14px;line-height:1.35;box-shadow:0 6px 20px rgba(0,0,0,.18);cursor:pointer}' +
+    '#vcToast.err{background:#fcebeb;color:#791f1f;border:1px solid #f09595}' +
+    '#vcToast.ok{background:#eaf3de;color:#27500a;border:1px solid #97c459}';
+  document.head.appendChild(css);
+  var t = document.createElement('div'); t.id = 'vcToast'; t.title = 'Toca para cerrar';
+  document.body.appendChild(t);
+  var timer = null;
+  function aviso(texto, tipo){
+    t.className = tipo === 'ok' ? 'ok' : 'err';
+    t.textContent = texto;
+    t.style.display = 'block';
+    clearTimeout(timer);
+    timer = setTimeout(function(){ t.style.display = 'none'; }, tipo === 'ok' ? 3500 : 12000);
+  }
+  t.onclick = function(){ t.style.display = 'none'; };
+  window.vcAviso = aviso;
+
+  // onError original escribe en la grilla de Tiendas, que no se ve en otras pantallas: además se muestra arriba.
+  var onErrorOriginal = window.onError;
+  window.onError = function(err){
+    try { if (typeof onErrorOriginal === 'function') onErrorOriginal.apply(this, arguments); } catch(e){}
+    var msg = (err && err.message) ? err.message : String(err || 'error desconocido');
+    try { console.error('[Visor] ', err); } catch(e){}
+    aviso('No se pudo completar: ' + msg, 'err');
+  };
+
+  // Agregar usuario: botón en "Guardando…" mientras escribe en Creator, y aviso del resultado.
+  if (typeof window.addUserConfirm === 'function'){
+    window.addUserConfirm = function(){
+      var e = document.getElementById('newEmail').value.trim();
+      var r = document.getElementById('newRole').value;
+      if (!e){ alert('Ingresa un correo.'); return; }
+      var btn = document.querySelector('#addOv button[onclick="addUserConfirm()"]');
+      function listo(){ if (btn){ btn.disabled = false; btn.innerHTML = 'A&ntilde;adir'; } }
+      if (btn){ btn.disabled = true; btn.textContent = 'Guardando\u2026'; }
+      google.script.run
+        .withSuccessHandler(function(d){ listo(); ADMIN = d; closeAddUser(); renderUsersView(d); aviso('Usuario guardado: ' + e.toLowerCase(), 'ok'); })
+        .withFailureHandler(function(err){ listo(); onError(err); })
+        .setUserRole(e, r);
+    };
+  }
+})();
 
 /* ---------- 1) Campos: protección de cambios sin guardar ---------- */
 (function(){
