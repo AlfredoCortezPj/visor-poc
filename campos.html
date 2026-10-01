@@ -3396,8 +3396,11 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
 
   function irAPagina(mod){
     var ip = window.VC_INIT || {};
-    var url = 'https://creatorapp.zoho.com/' + (ip.scope || 'payjoy_ec') + '/' + (ip.appLinkName || 'app-de-campo') +
-              (ip.envUrlFragment || '') + '/#Page:' + PAGINAS[mod];
+    // Formato de Creator: el entorno va entre la cuenta y la app, p. ej.
+    //   https://creatorapp.zoho.com/<cuenta>/environment/development/<app>/#Page:<pagina>
+    // En producción el fragmento de entorno viene vacío y queda https://creatorapp.zoho.com/<cuenta>/<app>/#Page:<pagina>
+    var url = 'https://creatorapp.zoho.com/' + (ip.scope || 'payjoy_ec') + (ip.envUrlFragment || '') + '/' +
+              (ip.appLinkName || 'app-de-campo') + '/#Page:' + PAGINAS[mod];
     try {
       ZOHO.CREATOR.UTIL.navigateParentURL({ action: 'open', url: url, window: 'same' });
     } catch(e){
