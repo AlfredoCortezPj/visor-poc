@@ -3383,7 +3383,9 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
   var PAGINAS = { resumen: 'Resumen', tiendas: 'Tiendas', visitas: 'Visitas', usuarios: 'Usuarios', campos: 'Campos' };
 
   var css = document.createElement('style');
-  css.textContent = '.hamb,#navPanel,#navOverlay,#userMenu,#userChip .caret,[onclick="volverModulo()"]{display:none!important}' +
+  // La franja verde superior sobra: Creator ya muestra el nombre de la página y su propia navegación.
+  // Se oculta (no se borra), porque el código sigue escribiendo el rol y el correo en ella.
+  css.textContent = 'header.topbar,.hamb,#navPanel,#navOverlay,#userMenu,#userChip .caret,[onclick="volverModulo()"]{display:none!important}' +
                     '#userChip{cursor:default!important}';
   document.head.appendChild(css);
   window.toggleMenu = function(ev){ if (ev) ev.stopPropagation(); };
