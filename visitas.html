@@ -3375,6 +3375,239 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
   window.addEventListener('beforeunload', function(e){ if (sucio()){ e.preventDefault(); e.returnValue = ''; return ''; } });
 })();
 
+/* ---------- 3) Vista móvil de Usuarios y Campos (en computadora quedan como siempre) ---------- */
+(function(){
+  if (typeof window.renderUsersView !== 'function' || typeof window.renderCamposRows !== 'function') return;
+  var MQ = window.matchMedia ? window.matchMedia('(max-width: 768px)') : null;
+  function movil(){ return !!(MQ && MQ.matches); }
+  function escA(s){ return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'); }
+  function jsA(s){ return escA(String(s == null ? '' : s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")); }
+
+  var css = document.createElement('style');
+  css.textContent =
+    '@media (max-width:768px){' +
+      '.wrap{padding:10px 10px 40px!important}' +
+      '#camposView .tablewrap,#camposView .chint{display:none!important}' +
+      '.vc-lista{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}' +
+      '.vc-sec{display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin:14px 4px 6px;text-transform:uppercase;letter-spacing:.6px}' +
+      '.vc-fila{display:flex;align-items:center;gap:10px;padding:11px 12px;border-bottom:1px solid #eef1ee;cursor:pointer;-webkit-tap-highlight-color:transparent}' +
+      '.vc-fila:last-child{border-bottom:0}.vc-fila:active{background:#f3f7f2}.vc-fila.baja{opacity:.55}' +
+      '.vc-av{width:32px;height:32px;border-radius:50%;background:#eaf3de;color:#27500a;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;flex:none}' +
+      '.vc-nom{flex:1;min-width:0}.vc-nom b{display:block;font-weight:600;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '.vc-nom small{display:block;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+      '.vc-nom .vc-alerta{color:#b45309;white-space:normal}' +
+      '.vc-pos{width:22px;color:#8a938a;font-size:12px;text-align:right;flex:none}' +
+      '.vc-chip{border-radius:20px;padding:2px 9px;font-size:11px;font-weight:600;flex:none}' +
+      '.vc-ojo{border:0;background:none;color:var(--green-d);padding:6px;flex:none;display:flex}' +
+      '.vc-fx{font-size:10px;background:#eeedfe;color:#3c3489;border-radius:6px;padding:1px 5px;margin-left:5px;font-weight:600}' +
+      '.vc-tag{font-size:10px;border-radius:6px;padding:1px 5px;margin-left:5px;font-weight:600;background:#faeeda;color:#633806}' +
+    '}' +
+    '.vc-sw{position:relative;display:inline-block;width:38px;height:22px;flex:none}.vc-sw input{opacity:0;width:0;height:0}' +
+    '.vc-sw span{position:absolute;inset:0;border-radius:11px;background:#cfd5cf;transition:background .15s}' +
+    '.vc-sw span::after{content:"";position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:#fff;transition:transform .15s}' +
+    '.vc-sw input:checked+span{background:#2e9e3f}.vc-sw input:checked+span::after{transform:translateX(16px)}' +
+    '#vcHojaOv{position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:950;display:none}' +
+    '#vcHoja{position:fixed;left:0;right:0;bottom:0;z-index:951;background:#fff;border-radius:16px 16px 0 0;padding:10px 16px 18px;max-height:85vh;overflow:auto;transform:translateY(105%);transition:transform .2s;box-shadow:0 -4px 16px rgba(0,0,0,.12)}' +
+    '#vcHoja.open{transform:none}#vcHoja .asa{width:36px;height:4px;border-radius:2px;background:#d5d9d5;margin:0 auto 12px}' +
+    '#vcHoja h3{margin:0;font-size:16px}#vcHoja .sub{color:var(--muted);font-size:12px;margin:2px 0 12px;word-break:break-all}' +
+    '#vcHoja .lbl{font-size:11px;color:var(--muted);margin:10px 0 5px;text-transform:uppercase;letter-spacing:.5px}' +
+    '#vcHoja input[type=text],#vcHoja select{width:100%;box-sizing:border-box;border:1px solid #cfd5cf;border-radius:8px;padding:9px 10px;font-size:15px;background:#fff}' +
+    '#vcHoja .seg{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}' +
+    '#vcHoja .seg button{border:1px solid #cfd5cf;background:#fff;border-radius:8px;padding:8px 0;font-size:12px;cursor:pointer}' +
+    '#vcHoja .seg button.on{border-color:#1f7c2e;background:#eaf3de;color:#27500a;font-weight:600}' +
+    '#vcHoja .lin{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px}' +
+    '#vcHoja .pri{display:block;width:100%;margin-top:14px;border:0;border-radius:10px;padding:11px;background:#1f7c2e;color:#fff;font-weight:600;font-size:14px;cursor:pointer}' +
+    '#vcHoja .sec2{display:block;width:100%;margin-top:8px;border:1px solid #cfd5cf;border-radius:10px;padding:10px;background:#fff;font-size:14px;cursor:pointer}' +
+    '#vcHoja .peligro{display:block;width:100%;margin-top:10px;border:0;background:none;color:#c0392b;font-size:14px;padding:8px;cursor:pointer}' +
+    '#vcHoja .mov{display:flex;align-items:center;gap:10px}#vcHoja .mov button{width:40px;height:36px;border:1px solid #cfd5cf;border-radius:8px;background:#fff;font-size:16px;cursor:pointer}';
+  document.head.appendChild(css);
+
+  /* hoja inferior */
+  var ov = document.createElement('div'); ov.id = 'vcHojaOv';
+  var hoja = document.createElement('div'); hoja.id = 'vcHoja';
+  document.body.appendChild(ov); document.body.appendChild(hoja);
+  var alCerrar = null;
+  function abrirHoja(html, cerrar){
+    alCerrar = cerrar || null;
+    hoja.innerHTML = '<div class="asa"></div>' + html;
+    ov.style.display = 'block';
+    requestAnimationFrame(function(){ hoja.classList.add('open'); });
+  }
+  function cerrarHoja(){
+    hoja.classList.remove('open'); ov.style.display = 'none';
+    var f = alCerrar; alCerrar = null; if (f) f();
+  }
+  ov.onclick = cerrarHoja;
+  window.vcCerrarHoja = cerrarHoja;
+
+  /* ===== Usuarios ===== */
+  var GRUPOS = [['maestro', 'Maestro'], ['admin', 'Admin'], ['supervisor', 'Supervisores'], ['usuario', 'Ejecutivos']];
+  var CHIP = { maestro: ['#eeedfe', '#3c3489'], admin: ['#e6f1fb', '#0c447c'], supervisor: ['#e1f5ee', '#085041'], usuario: ['#f1efe8', '#444441'], baja: ['#fcebeb', '#791f1f'] };
+  function nombreDe(correo){
+    var partes = String(correo).split('@')[0].split(/[._-]+/).filter(function(p){ return p && p.toLowerCase() !== 'ext'; });
+    return partes.map(function(p){ return p.charAt(0).toUpperCase() + p.slice(1).toLowerCase(); }).join(' ') || correo;
+  }
+  function iniciales(n){ var p = n.split(' '); return (((p[0] || '')[0] || '') + ((p[1] || '')[0] || '')).toUpperCase(); }
+  function chip(rol){ var c = CHIP[rol] || CHIP.usuario; return '<span class="vc-chip" style="background:' + c[0] + ';color:' + c[1] + '">' + escA(rol) + '</span>'; }
+  function filaUsuario(u, conOjo){
+    var n = nombreDe(u.correo), baja = (u.estado === 'BAJA');
+    var ojo = (conOjo && !baja && u.rol !== 'maestro')
+      ? '<button class="vc-ojo" aria-label="Ver como" onclick="event.stopPropagation();verComo(\'' + jsA(u.correo) + '\')">' + ICON_EYE + '</button>' : '';
+    var ext = /\.ext@|@ext\./i.test(u.correo) ? '<span class="vc-tag">ext</span>' : '';
+    return '<div class="vc-fila' + (baja ? ' baja' : '') + '" onclick="vcHojaUsuario(\'' + jsA(u.correo) + '\')">' +
+      '<div class="vc-av">' + escA(iniciales(n)) + '</div>' +
+      '<div class="vc-nom"><b>' + escA(n) + ext + '</b><small>' + escA(u.correo) + '</small></div>' +
+      chip(baja ? 'baja' : u.rol) + ojo + '</div>';
+  }
+
+  var renderUsersViewOriginal = window.renderUsersView;
+  window.renderUsersView = function(d){
+    if (!movil()) return renderUsersViewOriginal.apply(this, arguments);
+    ADMIN = d;
+    document.getElementById('usersView').innerHTML =
+      '<div class="uhead"><h2>Usuarios</h2></div>' +
+      '<div class="utoolbar" style="gap:8px"><input class="search" id="userSearch" placeholder="Buscar usuario&hellip;" oninput="renderUsersRows()" style="flex:1;max-width:none">' +
+        '<button class="iconbtn add" title="Agregar usuario" onclick="openAddUser()">+</button></div>' +
+      '<div id="vcUsuarios"></div>';
+    renderUsersRows();
+  };
+  var renderUsersRowsOriginal = window.renderUsersRows;
+  window.renderUsersRows = function(){
+    var cont = document.getElementById('vcUsuarios');
+    if (!movil() || !cont) return renderUsersRowsOriginal.apply(this, arguments);
+    var d = ADMIN || { roles: [] };
+    var qEl = document.getElementById('userSearch'), q = qEl ? qEl.value.trim().toLowerCase() : '';
+    var lista = d.roles.filter(function(u){
+      return !q || u.correo.toLowerCase().indexOf(q) > -1 || nombreDe(u.correo).toLowerCase().indexOf(q) > -1 || String(u.rol).indexOf(q) > -1;
+    });
+    var html = '';
+    GRUPOS.forEach(function(g){
+      var del = lista.filter(function(u){ return u.rol === g[0] && u.estado !== 'BAJA'; });
+      if (!del.length) return;
+      html += '<div class="vc-sec"><span>' + g[1] + '</span><span>' + del.length + '</span></div><div class="vc-lista">' +
+              del.map(function(u){ return filaUsuario(u, true); }).join('') + '</div>';
+    });
+    var bajas = lista.filter(function(u){ return u.estado === 'BAJA'; });
+    if (bajas.length) html += '<div class="vc-sec"><span>De baja</span><span>' + bajas.length + '</span></div><div class="vc-lista">' +
+                              bajas.map(function(u){ return filaUsuario(u, false); }).join('') + '</div>';
+    cont.innerHTML = html || '<div class="empty">Sin resultados.</div>';
+  };
+  window.vcHojaUsuario = function(correo){
+    var d = ADMIN; if (!d) return;
+    var u = d.roles.filter(function(x){ return x.correo === correo; })[0]; if (!u) return;
+    var n = nombreDe(u.correo), baja = (u.estado === 'BAJA'), maestro = (u.rol === 'maestro');
+    var html = '<h3>' + escA(n) + '</h3><div class="sub">' + escA(u.correo) + '</div>';
+    if (maestro || baja){
+      html += '<div class="lbl">Rol</div><div>' + chip(baja ? 'baja' : u.rol) + '</div>' +
+              '<div class="sub" style="margin-top:12px">' + (baja ? 'Usuario dado de baja: sin acceso a la app.' : (u.correo === d.maestro ? 'Maestro fijo: no se puede modificar.' : 'Los maestros no se modifican desde aquí.')) + '</div>' +
+              '<button class="sec2" onclick="vcCerrarHoja()">Cerrar</button>';
+    } else {
+      html += '<div class="lbl">Rol</div><div class="seg">' + d.rolesValidos.map(function(r){
+                return '<button class="' + (r === u.rol ? 'on' : '') + '" onclick="vcCambiarRol(\'' + jsA(u.correo) + '\',\'' + jsA(r) + '\')">' + escA(r) + '</button>';
+              }).join('') + '</div>' +
+              '<button class="pri" onclick="vcCerrarHoja();verComo(\'' + jsA(u.correo) + '\')">Ver como ' + escA(n.split(' ')[0]) + '</button>' +
+              '<button class="peligro" onclick="vcBaja(\'' + jsA(u.correo) + '\')">Dar de baja</button>';
+    }
+    abrirHoja(html);
+  };
+  window.vcCambiarRol = function(correo, rol){
+    var u = (ADMIN.roles.filter(function(x){ return x.correo === correo; })[0]) || {};
+    if (u.rol === rol) return;
+    cerrarHoja();
+    google.script.run.withSuccessHandler(function(d){ ADMIN = d; renderUsersView(d); }).withFailureHandler(onError).setUserRole(correo, rol);
+  };
+  window.vcBaja = function(correo){
+    if (!confirm('\u00bfDar de baja a ' + correo + '? Quedar\u00e1 sin acceso a la app.')) return;
+    cerrarHoja();
+    google.script.run.withSuccessHandler(function(){
+      if (ADMIN && ADMIN.roles) ADMIN.roles.forEach(function(u){ if (u.correo === correo) u.estado = 'BAJA'; });
+      renderUsersRows();
+    }).withFailureHandler(onError).removeUser(correo);
+  };
+
+  var renderSupOriginal = window.renderSupervisorUsers;
+  window.renderSupervisorUsers = function(d){
+    if (!movil()) return renderSupOriginal.apply(this, arguments);
+    var filas = (d.roles || []).map(function(u){
+      var n = nombreDe(u.correo);
+      return '<div class="vc-fila" onclick="verComo(\'' + jsA(u.correo) + '\')"><div class="vc-av">' + escA(iniciales(n)) + '</div>' +
+             '<div class="vc-nom"><b>' + escA(n) + '</b><small>' + escA(u.correo) + '</small></div>' +
+             '<span class="vc-ojo">' + ICON_EYE + '</span></div>';
+    }).join('');
+    document.getElementById('usersView').innerHTML =
+      '<div class="uhead"><h2>Mis ejecutivos</h2></div>' +
+      '<div class="vc-sec"><span>Ejecutivos a tu cargo</span><span>' + (d.roles || []).length + '</span></div>' +
+      (filas ? '<div class="vc-lista">' + filas + '</div>' : '<div class="empty">No tienes ejecutivos asignados.</div>');
+  };
+
+  /* ===== Campos ===== */
+  function idx(id){ for (var i = 0; i < CAMPOS_STATE.length; i++){ if (CAMPOS_STATE[i]._id === id) return i; } return -1; }
+  function esCalc(it){ return it.estado === 'calculado' || it.estado === 'calculado_nuevo'; }
+  var renderRowsOriginal = window.renderCamposRows;
+  window.renderCamposRows = function(){
+    var r = renderRowsOriginal.apply(this, arguments);       // mantiene la tabla de escritorio al día
+    if (!movil()) return r;
+    if (CAMPOS_SORT){ CAMPOS_SORT.destroy(); CAMPOS_SORT = null; }   // sin arrastre en el celular
+    var tw = document.querySelector('#camposView .tablewrap'); if (!tw) return r;
+    var cont = document.getElementById('vcCampos');
+    if (!cont){ cont = document.createElement('div'); cont.id = 'vcCampos'; tw.parentNode.insertBefore(cont, tw.nextSibling); }
+    var q = CAMPOS_QUERY, html = '';
+    CAMPOS_STATE.forEach(function(it, i){
+      var ok = !q || String(it.columna).toLowerCase().indexOf(q) > -1 || String(it.etiqueta).toLowerCase().indexOf(q) > -1;
+      if (!ok) return;
+      var badges = (esCalc(it) ? '<span class="vc-fx">&fnof;</span>' : '') +
+                   ((it.estado === 'nueva' || it.estado === 'calculado_nuevo') ? '<span class="vc-tag">nueva</span>' : '') +
+                   (it.estado === 'huerfana' ? '<span class="vc-tag">hu&eacute;rfana</span>' : '');
+      html += '<div class="vc-fila" onclick="vcEditarCampo(' + it._id + ')"><span class="vc-pos">' + (i + 1) + '</span>' +
+              '<div class="vc-nom"><b>' + escA(it.columna) + badges + '</b><small>' + (it.etiqueta ? escA(it.etiqueta) : 'Sin etiqueta') + '</small>' +
+              (it.alerta ? '<small class="vc-alerta">&#9888; ' + escA(it.alerta) + '</small>' : '') + '</div>' +
+              '<label class="vc-sw" onclick="event.stopPropagation()" aria-label="Ver en el detalle"><input type="checkbox"' + (it.enDetalle ? ' checked' : '') +
+              ' onchange="campoEdit(' + it._id + ',\'enDetalle\',this.checked)"><span></span></label></div>';
+    });
+    cont.innerHTML = html ? '<div class="vc-lista">' + html + '</div>' : '<div class="empty">Sin resultados.</div>';
+    return r;
+  };
+  function hojaCampo(id){
+    var i = idx(id); if (i < 0) return '';
+    var it = CAMPOS_STATE[i], calc = esCalc(it);
+    var fmt = CAMPOS_FORMATOS.map(function(o){ return '<option value="' + escA(o) + '"' + (normU(o) === normU(it.formato) ? ' selected' : '') + '>' + escA(cap(o)) + '</option>'; }).join('');
+    var html = '<h3>' + escA(it.columna) + (calc ? ' <span class="vc-fx">&fnof;</span>' : '') + '</h3><div class="sub">' +
+               (calc ? 'Campo calculado' : (it.estado === 'huerfana' ? 'Ya no existe en Tiendas' : 'Columna de Tiendas')) + '</div>' +
+               '<div class="lbl">Etiqueta</div><input type="text" value="' + escA(it.etiqueta) + '" placeholder="' + escA(it.columna) + '" oninput="campoEdit(' + id + ',\'etiqueta\',this.value)">';
+    if (!calc) html += '<div class="lbl">Formato</div><select onchange="campoEdit(' + id + ',\'formato\',this.value)">' + fmt + '</select>';
+    html += '<div class="lin"><span>Ver en el detalle</span><label class="vc-sw"><input type="checkbox"' + (it.enDetalle ? ' checked' : '') + ' onchange="campoEdit(' + id + ',\'enDetalle\',this.checked)"><span></span></label></div>' +
+            '<div class="lin"><span>Sensible (se muestra como rango)</span><label class="vc-sw"><input type="checkbox"' + (it.protegida ? ' checked' : '') + ' onchange="campoEdit(' + id + ',\'protegida\',this.checked)"><span></span></label></div>' +
+            '<div class="lbl">Posición</div><div class="mov"><button onclick="vcMover(' + id + ',-1)" aria-label="Subir">&uarr;</button><span id="vcPosTxt">' + (i + 1) + ' de ' + CAMPOS_STATE.length + '</span>' +
+            '<button onclick="vcMover(' + id + ',1)" aria-label="Bajar">&darr;</button></div>';
+    if (calc) html += '<button class="sec2" onclick="vcCerrarHoja();openCalcModal(\'' + jsA(it.columna) + '\')">Editar receta</button>' +
+                      '<button class="peligro" onclick="vcCerrarHoja();deleteCalc(\'' + jsA(it.columna) + '\')">Borrar receta</button>';
+    if (it.estado === 'huerfana') html += '<button class="peligro" onclick="vcCerrarHoja();quitarCampo(' + id + ')">Quitar de la configuración</button>';
+    html += '<button class="pri" onclick="vcCerrarHoja()">Listo</button>';
+    return html;
+  }
+  window.vcEditarCampo = function(id){ abrirHoja(hojaCampo(id), function(){ renderCamposRows(); }); };
+  window.vcMover = function(id, delta){
+    var i = idx(id); if (i < 0) return;
+    var dest = Math.max(1, Math.min(CAMPOS_STATE.length, i + 1 + delta));
+    if (dest === i + 1) return;
+    campoMover(id, dest);
+    var t = document.getElementById('vcPosTxt'); if (t) t.textContent = dest + ' de ' + CAMPOS_STATE.length;
+  };
+
+  // Si cambia el ancho (girar el celular, achicar la ventana), se vuelve a pintar con la vista que corresponde.
+  if (MQ){
+    var alCambiar = function(){
+      var cv = document.getElementById('camposView'), uv = document.getElementById('usersView');
+      if (cv && cv.style.display !== 'none' && document.getElementById('fieldList')){
+        var c = document.getElementById('vcCampos'); if (c && !movil()) c.remove();
+        renderCamposRows();
+      }
+      if (uv && uv.style.display !== 'none' && ADMIN && STATE.role === 'maestro') renderUsersView(ADMIN);
+    };
+    if (MQ.addEventListener) MQ.addEventListener('change', alCambiar); else if (MQ.addListener) MQ.addListener(alCambiar);
+  }
+})();
+
 /* ---------- 2) Páginas por módulo ---------- */
 (function(){
   var MOD = window.VC_MODULO;
@@ -3387,6 +3620,8 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
   // Se oculta (no se borra), porque el código sigue escribiendo el rol y el correo en ella.
   css.textContent = 'header.topbar,.hamb,#navPanel,#navOverlay,#userMenu,#userChip .caret,[onclick="volverModulo()"]{display:none!important}' +
                     '#userChip{cursor:default!important}';
+  // En el celular, Creator ya muestra el nombre de la página: se quitan los títulos internos.
+  css.textContent += '@media (max-width:768px){.uhead h2,.rsm-title{display:none!important}.rsm-head{justify-content:flex-end!important}}';
   document.head.appendChild(css);
   window.toggleMenu = function(ev){ if (ev) ev.stopPropagation(); };
 
