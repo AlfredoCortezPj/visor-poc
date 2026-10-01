@@ -3625,17 +3625,47 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
   document.head.appendChild(css);
   window.toggleMenu = function(ev){ if (ev) ev.stopPropagation(); };
 
-  var CLAVE = 'vc_viewAs';
-  function leerVA(){ try { return sessionStorage.getItem(CLAVE) || null; } catch(e){ return null; } }
-  function guardarVA(v){ try { if (v) sessionStorage.setItem(CLAVE, v); else sessionStorage.removeItem(CLAVE); } catch(e){} }
+  // "Ver como" se guarda en dos memorias del navegador: la de sesión (pestaña) y la persistente
+  // (compartida entre páginas aunque el celular abra cada una en un contenedor propio), con vencimiento.
+  var CLAVE = 'vc_viewAs', CLAVE_T = 'vc_viewAs_param_t', VIGENCIA_MS = 8 * 60 * 60 * 1000;
+  function leerVA(){
+    try { var s = sessionStorage.getItem(CLAVE); if (s) return s; } catch(e){}
+    try {
+      var o = JSON.parse(localStorage.getItem(CLAVE) || 'null');
+      if (o && o.email && o.hasta > Date.now()) return o.email;
+    } catch(e){}
+    return null;
+  }
+  function guardarVA(v){
+    try { if (v) sessionStorage.setItem(CLAVE, v); else sessionStorage.removeItem(CLAVE); } catch(e){}
+    try { if (v) localStorage.setItem(CLAVE, JSON.stringify({ email: v, hasta: Date.now() + VIGENCIA_MS })); else localStorage.removeItem(CLAVE); } catch(e){}
+  }
+  // Tercer respaldo: el salto desde Usuarios también lleva el correo en la dirección de la página
+  // (?vercomo=...&t=...). Se aplica una sola vez por salto, para que "Salir de esta vista" no lo reactive.
+  function leerParametro(){
+    return new Promise(function(ok){
+      var listo = false; function fin(v){ if (!listo){ listo = true; ok(v); } }
+      setTimeout(function(){ fin(null); }, 6000);
+      (function esperar(n){
+        var U = window.ZOHO && ZOHO.CREATOR && ZOHO.CREATOR.UTIL;
+        if (U && typeof U.getQueryParams === 'function'){
+          try { Promise.resolve(U.getQueryParams()).then(function(qp){ fin(qp || null); }, function(){ fin(null); }); }
+          catch(e){ fin(null); }
+          return;
+        }
+        if (n > 50) return fin(null);
+        setTimeout(function(){ esperar(n + 1); }, 100);
+      })(0);
+    });
+  }
 
-  function irAPagina(mod){
+  function irAPagina(mod, extra){
     var ip = window.VC_INIT || {};
     // Formato de Creator: el entorno va entre la cuenta y la app, p. ej.
     //   https://creatorapp.zoho.com/<cuenta>/environment/development/<app>/#Page:<pagina>
     // En producción el fragmento de entorno viene vacío y queda https://creatorapp.zoho.com/<cuenta>/<app>/#Page:<pagina>
     var url = 'https://creatorapp.zoho.com/' + (ip.scope || 'payjoy_ec') + (ip.envUrlFragment || '') + '/' +
-              (ip.appLinkName || 'app-de-campo') + '/#Page:' + PAGINAS[mod];
+              (ip.appLinkName || 'app-de-campo') + '/#Page:' + PAGINAS[mod] + (extra || '');
     try {
       ZOHO.CREATOR.UTIL.navigateParentURL({ action: 'open', url: url, window: 'same' });
     } catch(e){
@@ -3682,10 +3712,28 @@ if (!window.VC_MODULO) bootstrap(null, 'resumen');   // arranque: UNA lectura ar
 
   if (MOD === 'usuarios'){
     // Desde Usuarios, "Ver como" guarda la vista elegida y abre la página Resumen.
-    window.verComo = function(email){ if (!email) return; guardarVA(String(email).trim().toLowerCase()); irAPagina('resumen'); };
+    window.verComo = function(email){
+      if (!email) return;
+      var e = String(email).trim().toLowerCase();
+      guardarVA(e);
+      irAPagina('resumen', '?vercomo=' + encodeURIComponent(e) + '&t=' + Date.now());
+    };
   }
 
-  window.bootstrap(leerVA());
+  (async function arrancar(){
+    var va = leerVA(), origen = va ? 'memoria' : 'ninguno';
+    var qp = await leerParametro();
+    if (qp && qp.vercomo && qp.t){
+      var t = Number(qp.t) || 0, ultimo = 0;
+      try { ultimo = Number(localStorage.getItem(CLAVE_T)) || 0; } catch(e){}
+      if (t > ultimo){
+        va = String(qp.vercomo).trim().toLowerCase(); origen = 'parametro';
+        try { localStorage.setItem(CLAVE_T, String(t)); } catch(e){}
+      }
+    }
+    if (window.VC_DIAG) VC_DIAG.verComoOrigen = origen;
+    window.bootstrap(va);
+  })();
 })();
 
 </script>
